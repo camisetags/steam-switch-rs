@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/logic", "firmware"]
+default-members = ["crates/logic"]
+resolver = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"

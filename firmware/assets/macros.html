@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Macro editor · SteamSwitch RS</title>
+<style>
+:root{color-scheme:dark;--canvas:#16212b;--surface:#202f3d;--line:#46596a;--text:#f2f6f8;--muted:#bbcbd6;--accent:#9cd9fc;--dark:#10252f;--error:#ffba9b;font:16px/1.45 'Atkinson Hyperlegible Next',system-ui,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text)}
+header,main{width:min(1060px,100%);margin:auto;padding:1.1rem clamp(.9rem,3vw,2.2rem)}
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;border-bottom:1px solid var(--line)}
+header strong{font-family:'Barlow Condensed','Arial Narrow',sans-serif;font-size:1.45rem;letter-spacing:.02em}
+.links{display:flex;flex-wrap:wrap;gap:.4rem 1rem;color:var(--muted);margin:0;font-size:.875rem}.links span::before{content:'○';margin-right:.35rem}.links .active::before{content:'●';color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(0,3fr);gap:1rem;align-items:start}
+section,aside{background:var(--surface);border:1px solid var(--line);border-radius:.55rem;padding:1rem;min-width:0}
+section h1,aside h2{margin:0 0 .75rem;font-family:'Barlow Condensed','Arial Narrow',sans-serif}h1{font-size:1.6rem}h2{font-size:1.18rem}
+button,input,select{font:inherit;color:inherit;border:1px solid var(--line);border-radius:.32rem;padding:.45rem .55rem;background:var(--canvas);min-height:2.5rem}
+button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent)}button:disabled{opacity:.47;cursor:default}.primary{background:var(--accent);border-color:var(--accent);color:var(--dark);font-weight:700}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}a{color:var(--accent)}
+.bar,.actions{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}.actions{padding-top:1rem;border-top:1px solid var(--line)}
+#library{list-style:none;padding:0;display:grid;gap:.35rem}#library button{width:100%;text-align:left;overflow-wrap:anywhere}#library button[aria-current]{border-color:var(--accent)}small,.subtle{color:var(--muted)}
+.meta{display:grid;grid-template-columns:2fr 1fr 1fr;gap:.6rem;margin:1rem 0}label{display:grid;gap:.2rem}input{width:100%;min-width:0}
+#steps{padding:0;list-style:none;display:grid;gap:.65rem;margin:.75rem 0 1rem;max-height:min(52vh,32rem);overflow:auto;scrollbar-color:var(--line) var(--surface)}
+.step{border:1px solid var(--line);border-radius:.35rem;padding:.65rem;display:grid;gap:.65rem}.step strong{font-family:'IBM Plex Mono',monospace}.stepHead{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:.35rem}.duration{max-width:8rem}.axes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.4rem}
+fieldset{border:0;margin:0;padding:0}legend{padding:0;margin-bottom:.2rem}.buttons{display:flex;flex-wrap:wrap;gap:.25rem .55rem}.buttons label{display:inline-flex;align-items:center;gap:.2rem;min-height:2rem}.buttons input{width:1rem;min-height:0;accent-color:var(--accent)}
+dialog{background:var(--surface);color:inherit;border:1px solid var(--line);border-radius:.55rem;width:min(32rem,calc(100% - 1.5rem))}dialog h2{margin:.2rem 0 .7rem}dialog textarea{width:100%;min-height:9rem;resize:vertical;margin-bottom:.75rem;padding:.6rem;background:var(--canvas);color:inherit;border:1px solid var(--line);font-family:'IBM Plex Mono',monospace}dialog::backdrop{background:#0b1219bb}
+progress{width:100%;display:block;margin:.75rem 0;accent-color:var(--accent)}#notice{grid-column:1/-1;min-height:1.45em;margin:0;color:var(--accent)}#notice.error{color:var(--error)}#recordStatus{color:var(--muted)}
+@media(max-width:690px){main{grid-template-columns:1fr}.meta{grid-template-columns:1fr 1fr}.meta label:first-child{grid-column:1/-1}}
+@media(max-width:375px){.axes{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+<strong>SteamSwitch RS</strong>
+<p class="links"><span id="steam">Controller disconnected</span><span id="console">Switch disconnected</span></p>
+</header>
+<main>
+<p id="notice" role="status" aria-live="polite"></p>
+<aside aria-label="Macro library">
+<h2>Library</h2>
+<div class="bar"><button id="new">New</button><button id="import">Import JSON</button></div>
+<ul id="library"></ul>
+<p id="empty" class="subtle" hidden>No saved macros.</p>
+</aside>
+<section aria-labelledby="title">
+<h1 id="title">Macro editor</h1>
+<div class="bar"><button id="record">Start recording</button><button id="play">Play</button><button id="stop">Stop</button><button id="rumble">Test rumble</button></div>
+<progress id="progress" aria-label="Playback progress" hidden></progress><p id="recordStatus" hidden></p>
+<div class="meta"><label>Name<input id="name" maxlength="100"></label><label>Game<input id="game" maxlength="100"></label><label>Author<input id="author" maxlength="100"></label></div>
+<div class="bar"><strong>Steps</strong><button id="add">Add step</button><span id="duration" class="subtle"></span></div>
+<ol id="steps"></ol>
+<div class="actions"><button id="save" class="primary">Save macro</button><button id="download">Download JSON</button><button id="delete" disabled>Delete</button></div>
+</section>
+</main>
+<dialog id="importDialog" aria-labelledby="importTitle">
+<h2 id="importTitle">Import a macro</h2>
+<label>Paste macro JSON<textarea id="jsonInput"></textarea></label>
+<p id="importError" role="alert" class="error" hidden></p>
+<div class="bar"><button id="fileButton">Choose file</button><input type="file" accept="application/json,.json" id="file" hidden><button class="primary" id="importApply">Import</button><button id="importCancel">Cancel</button></div>
+</dialog>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const buttons = ['A','B','X','Y','L','R','ZL','ZR','Plus','Minus','Home','Capture','LStick','RStick','Up','Down','Left','Right','GL','GR'];
+const axes = [['lx','Left X'],['ly','Left Y'],['rx','Right X'],['ry','Right Y']];
+const blankStep = () => ({d:100,b:[],lx:2048,ly:2048,rx:2048,ry:2048});
+let doc = {v:1,id:'',name:'Untitled macro',game:'',author:'',created:0,steps:[blankStep()]};
+let selected = '', recording = false, busy = false, online = true;
+const draftKey = 'steam-switch-rs.macro-draft';
+
+function tell(message,error=false){ $('notice').textContent=message; $('notice').classList.toggle('error',error); }
+function create(tag,text){const node=document.createElement(tag); if(text!==undefined)node.textContent=text; return node;}
+function click(text,callback,label){const button=create('button',text); button.type='button'; if(label)button.setAttribute('aria-label',label); button.onclick=callback; return button;}
+function change(steps,index,next){[steps[index],steps[next]]=[steps[next],steps[index]]; renderSteps(); $('steps').children[next].querySelector('.duration input').focus();}
+function normalize(step){
+ const names=Array.isArray(step.b)?step.b.map(name=>{
+   const value=String(name); return value==='+'?'Plus':value==='-'?'Minus':buttons.find(button=>button.toLowerCase()===value.toLowerCase())||value;
+ }):buttons.filter((_,i)=>Number(step.b)&(1<<i));
+ return {...blankStep(),...step,b:names};
+}
+function numeric(label,value,min,max,fn){
+ const node=create('label',label), input=create('input'); input.type='number'; input.min=min; input.max=max; input.value=value;
+ input.onchange=()=>{const number=input.valueAsNumber; input.value=Number.isFinite(number)?Math.max(min,Math.min(max,Math.round(number))):value; fn(Number(input.value));};
+ node.append(input); return node;
+}
+function renderSteps(){
+ $('steps').replaceChildren();
+ updateDuration();
+ doc.steps.forEach((step,i)=>{
+   const item=create('li'); item.className='step'; const head=create('div'); head.className='stepHead';
+   const duration=numeric('Hold (ms)',step.d,10,60000,value=>{step.d=value;updateDuration();}); duration.className='duration';
+   const tools=create('div'); tools.className='bar';
+   const up=click('↑',()=>change(doc.steps,i,i-1),`Move step ${i+1} up`); up.disabled=i===0;
+   const down=click('↓',()=>change(doc.steps,i,i+1),`Move step ${i+1} down`); down.disabled=i+1===doc.steps.length;
+   const duplicate=click('Duplicate',()=>{if(doc.steps.length>=2000){tell('A macro can contain at most 2,000 steps.',true);return;}doc.steps.splice(i+1,0,{...step,b:[...step.b]});renderSteps();$('steps').children[i+1].querySelector('input').focus();},`Duplicate step ${i+1}`);
+   const remove=click('Remove',()=>{doc.steps.splice(i,1);renderSteps();const next=$('steps').children[Math.min(i,doc.steps.length-1)];(next?next.querySelector('input'):$('add')).focus();},`Remove step ${i+1}`);
+   tools.append(up,down,duplicate,remove); head.append(create('strong',`Step ${i+1}`),duration,tools);
+   const group=create('fieldset'); group.append(create('legend',`Buttons for step ${i+1}`)); const keys=create('div'); keys.className='buttons';
+   buttons.forEach(name=>{const label=create('label'),input=create('input');input.type='checkbox';input.checked=step.b.includes(name);
+     input.onchange=()=>{step.b=input.checked?[...new Set([...step.b,name])]:step.b.filter(value=>value!==name);};
+     label.append(input,name); keys.append(label);}); group.append(keys);
+   const axisFields=create('div'); axisFields.className='axes'; axes.forEach(([key,label])=>axisFields.append(numeric(label,step[key],0,4095,value=>step[key]=value)));
+   item.append(head,group,axisFields); $('steps').append(item);
+ });
+}
+function updateDuration(){$('duration').textContent=`${doc.steps.reduce((sum,step)=>sum+Number(step.d),0)} ms total`;}
+function select(document,id){
+ doc={...document,steps:document.steps.map(normalize)}; selected=id;
+ for(const field of ['name','game','author']) $(field).value=doc[field]||'';
+ $('delete').disabled=!selected;
+ renderSteps(); markSelection();
+}
+function snapshot(){return {...doc,...Object.fromEntries(['name','game','author'].map(field=>[field,$(field).value]))};}
+function storeDraft(){try{localStorage.setItem(draftKey,JSON.stringify({doc:snapshot(),selected}));}catch{}}
+function restoreDraft(){try{const saved=JSON.parse(localStorage.getItem(draftKey));if(saved&&Array.isArray(saved.doc.steps))select(saved.doc,saved.selected||'');}catch{}}
+function markSelection(){for(const button of $('library').querySelectorAll('button')){if(button.dataset.id===selected)button.setAttribute('aria-current','true');else button.removeAttribute('aria-current');}}
+async function api(path,method='GET',value){
+ const response=await fetch(path,{method,headers:value===undefined?{}:{'Content-Type':'application/json'},body:value===undefined?undefined:JSON.stringify(value)});
+ const data=await response.json(); if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`); return data;
+}
+async function refreshLibrary(){
+ const rows=await api('/api/macros'); $('library').replaceChildren(); $('empty').hidden=rows.length>0;
+ rows.forEach(row=>{const item=create('li'),button=click(row.name,()=>act(async()=>{select(await api(`/api/macro?id=${row.id}`),row.id);tell('Macro loaded.');}));
+   button.dataset.id=row.id; button.append(create('br'),create('small',`${row.steps} steps · ${row.ms} ms`)); item.append(button); $('library').append(item);});
+ markSelection();
+}
+function controls(){for(const id of ['record','play','stop','rumble','save'])$(id).disabled=busy||!online; $('delete').disabled=busy||!online||!selected;}
+async function act(fn){
+ if(busy)return; busy=true; controls();
+ try{await fn();}catch(error){tell(error.message,true);}finally{busy=false;controls();}
+}
+async function refreshStatus(){
+ try{
+   const state=await api('/api/status'); online=true;
+   $('steam').textContent=`Controller ${state.sc2?'connected':'disconnected'}`; $('steam').classList.toggle('active',state.sc2);
+   $('console').textContent=`Switch ${state.streaming?'receiving input':state.console?'connected':'disconnected'}`; $('console').classList.toggle('active',state.streaming);
+   if(!busy){recording=state.recording; $('record').textContent=recording?'Finish recording':'Start recording';}
+   $('recordStatus').hidden=!state.recording; $('recordStatus').textContent=`Recording · ${(state.rec_ms/1000).toFixed(1)} s`;
+   $('progress').hidden=!state.playing; if(state.playing){$('progress').max=state.dur;$('progress').value=state.pos;}
+ }catch{online=false;for(const id of ['steam','console'])$(id).classList.remove('active'); $('steam').textContent='Adapter unreachable';$('console').textContent='Switch status unavailable';}
+ controls(); setTimeout(refreshStatus,750);
+}
+$('new').onclick=()=>{select({v:1,id:'',name:'Untitled macro',steps:[blankStep()]},'');$('name').focus();tell('');};
+$('add').onclick=()=>{if(doc.steps.length>=2000){tell('A macro can contain at most 2,000 steps.',true);return;}doc.steps.push(blankStep());renderSteps();$('steps').lastElementChild.querySelector('input').focus();};
+$('save').onclick=()=>act(async()=>{const current=snapshot();const path='/api/macro'+(selected?`?id=${selected}`:''); const saved=await api(path,'POST',current);selected=doc.id=saved.id;await refreshLibrary();tell(`Saved ${current.name||'macro'}.`);});
+$('delete').onclick=()=>act(async()=>{if(!selected||!confirm(`Delete “${$('name').value}” from the adapter?`))return;await api(`/api/macro?id=${selected}`,'DELETE');$('new').click();await refreshLibrary();tell('Macro deleted.');});
+$('play').onclick=()=>act(async()=>{await api('/api/play','POST',snapshot());tell('Playing macro.');});
+$('stop').onclick=()=>act(async()=>{await api('/api/stop','POST');tell('Playback stopped.');});
+$('rumble').onclick=()=>act(async()=>{await api('/api/rumble','POST');tell('Rumble test sent.');});
+$('record').onclick=()=>act(async()=>{
+ if(recording){select(await api('/api/record','POST',{action:'stop'}),'');tell('Recording loaded into the editor.');}
+ else{await api('/api/record','POST',{action:'start'});tell('Recording controller input.');}
+ recording=!recording; $('record').textContent=recording?'Finish recording':'Start recording';
+});
+$('import').onclick=()=>{$('jsonInput').value='';$('importError').hidden=true;$('importDialog').showModal();$('jsonInput').focus();};
+$('importCancel').onclick=()=>$('importDialog').close();
+$('fileButton').onclick=()=>$('file').click();
+function importError(error){$('importError').textContent=error.message;$('importError').hidden=false;}
+$('file').onchange=async()=>{const file=$('file').files[0];$('file').value='';if(!file)return;
+ try{if(file.size>98304)throw new Error('Macro JSON is too large.');$('jsonInput').value=await file.text();$('importError').hidden=true;}catch(error){importError(error);}};
+$('importApply').onclick=()=>{
+ try{const raw=$('jsonInput').value;if(new Blob([raw]).size>98304)throw new Error('Macro JSON is too large.');const incoming=JSON.parse(raw);
+   if(!incoming||!Array.isArray(incoming.steps)||incoming.steps.length<1||incoming.steps.length>2000||incoming.steps.some(step=>!step||!Number.isFinite(step.d)))throw new Error('Invalid macro steps.');
+   select({...incoming,id:''},'');$('importDialog').close();tell('Imported into the editor. Save to keep a copy.');
+ }catch(error){importError(error);}
+};
+$('download').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(snapshot(),null,2)],{type:'application/json'}));const anchor=create('a');anchor.href=url;anchor.download=(doc.id||'macro')+'.json';anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+window.addEventListener('pagehide',storeDraft);
+select(doc,''); restoreDraft(); refreshLibrary().catch(error=>tell(error.message,true)); refreshStatus();
+</script>
+</body>
+</html>

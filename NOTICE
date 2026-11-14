@@ -1,0 +1,13 @@
+Steam Switch RS
+
+The Switch 2 protocol implementation incorporates MIT-licensed material from
+esp-cpp/espp, copyright 2022 esp-cpp. The original notice is reproduced in
+firmware/src/console/LICENSE-espp.
+
+The motion payload uses protocol techniques described by notsosaelin and other
+PicoSwitch2 contributors under the Apache License, Version 2.0. This project's
+Rust motion module implements the payload and its own sensor fusion.
+
+Steam Controller input format references include SDL (zlib license) and
+JoypadOS (Apache License, Version 2.0). Their projects publish the report
+formats used to implement this project's Rust input parser.
