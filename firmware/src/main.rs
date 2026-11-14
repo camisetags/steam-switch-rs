@@ -26,5 +26,9 @@ fn main() -> anyhow::Result<()> {
 mod console_protocol_tests;
 
 #[cfg(all(test, not(target_os = "espidf")))]
+#[path = "console/timing.rs"]
+mod console_timing_tests;
+
+#[cfg(all(test, not(target_os = "espidf")))]
 #[path = "steam/wire.rs"]
 mod steam_wire_tests;

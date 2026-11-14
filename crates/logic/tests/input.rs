@@ -1,4 +1,4 @@
-use controller_core::input::{Battery, Input, Mapper, decode};
+use controller_core::input::{Battery, Input, Mapper, Pad, PadEffect, PadFeedback, Stick, decode};
 
 #[test]
 fn face_buttons_follow_the_printed_labels() {
@@ -28,34 +28,102 @@ fn packet(right: i16, touched: bool, format: u8) -> Input {
 }
 
 #[test]
-fn gestures_start_and_end_at_neutral() {
+fn left_pad_uses_cardinal_dpad_buttons_and_leaves_the_stick_separate() {
     let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    for (x, y, expected) in [
+        (4_000, 4_000, 0),
+        (20_000, 4_000, 0x02),
+        (-20_000, 4_000, 0x04),
+        (4_000, 20_000, 0x08),
+        (4_000, -20_000, 0x01),
+    ] {
+        let mut input = Input {
+            left_pad: Pad {
+                position: Stick { x, y },
+                touched: true,
+            },
+            ..Input::default()
+        };
+        let report = mapper.encode(&input, battery, 0);
+        assert_eq!(report[3] & 0x0f, expected);
+        assert_eq!(axis(&report, 5), 2048);
+        input.left_stick.x = 32_767;
+        let report = mapper.encode(&input, battery, 0);
+        assert_eq!(report[3] & 0x0f, expected);
+        assert_eq!(axis(&report, 5), 4095);
+
+        input.buttons = 1 << 10; // Physical Down
+        assert_eq!(mapper.encode(&input, battery, 0)[3] & 0x0f, 0x01);
+        input.buttons = 0;
+        input.left_pad.touched = false;
+        assert_eq!(mapper.encode(&input, battery, 0)[3] & 0x0f, 0);
+    }
+}
+
+#[test]
+fn aim_ramps_between_packets_and_settles_when_the_finger_stops() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
     for format in [0x45, 0x47] {
+        mapper.encode(&packet(0, false, format), battery, 90_000);
         assert_eq!(
             axis(
-                &mapper.encode(&packet(8000, true, format), Battery::default(), 100_000),
+                &mapper.encode(&packet(8000, true, format), battery, 100_000),
                 8
             ),
             2048
         );
-        let moved = mapper.encode(&packet(8900, true, format), Battery::default(), 120_000);
-        assert!(axis(&moved, 8) > 2048);
+        let mut moved = mapper.encode(&packet(8900, true, format), battery, 120_000);
+        let at_sample = axis(&moved, 8);
+        mapper.apply_aim(&mut moved, 125_000);
+        let early = axis(&moved, 8);
+        mapper.apply_aim(&mut moved, 135_000);
+        assert!(at_sample < early && early < axis(&moved, 8));
         assert_eq!(moved[2], 2);
+
+        let mut stopped = mapper.encode(&packet(8900, true, format), battery, 140_000);
+        let at_stop = axis(&stopped, 8);
+        assert!(at_stop > 2048);
+        mapper.apply_aim(&mut stopped, 155_000);
+        assert!((2049..at_stop).contains(&axis(&stopped, 8)));
+        mapper.apply_aim(&mut stopped, 240_000);
+        assert_eq!(axis(&stopped, 8), 2048);
         assert_eq!(
             axis(
-                &mapper.encode(&packet(8900, true, format), Battery::default(), 140_000),
-                8
-            ),
-            2048
-        );
-        assert_eq!(
-            axis(
-                &mapper.encode(&packet(8900, false, format), Battery::default(), 160_000),
+                &mapper.encode(&packet(8900, false, format), battery, 245_000),
                 8
             ),
             2048
         );
     }
+}
+
+#[test]
+fn right_pad_keeps_the_steady_gain_and_clears_after_release_or_a_packet_gap() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    mapper.encode(&packet(8_000, true, 0x45), battery, 100_000);
+    let mut report = [0; 63];
+    for i in 1..=12 {
+        report = mapper.encode(
+            &packet(8_000 + i * 450, true, 0x45),
+            battery,
+            100_000 + u64::try_from(i).unwrap() * 10_000,
+        );
+    }
+    // 450 counts in 10 ms gives the previous firmware's 22.65% deflection.
+    assert!((2510..=2512).contains(&axis(&report, 8)));
+    mapper.apply_aim(&mut report, 320_000);
+    assert!((2048..=2049).contains(&axis(&report, 8)));
+    let fresh = mapper.encode(&packet(-20_000, true, 0x45), battery, 340_000);
+    assert_eq!(axis(&fresh, 8), 2048);
+
+    let mut moving = mapper.encode(&packet(-18_000, true, 0x45), battery, 350_000);
+    mapper.apply_aim(&mut moving, 365_000);
+    assert!(axis(&moving, 8) > 2048);
+    let released = mapper.encode(&packet(-18_000, false, 0x45), battery, 370_000);
+    assert_eq!(axis(&released, 8), 2048);
 }
 
 #[test]
@@ -65,8 +133,68 @@ fn physical_right_stick_wins_and_unknown_battery_is_healthy() {
     mapper.encode(&input, Battery::default(), 0);
     input.right_stick.x = -32768;
     input.right_pad.position.x = 30_000;
-    let report = mapper.encode(&input, Battery::default(), 15_000);
+    let mut report = mapper.encode(&input, Battery::default(), 15_000);
+    mapper.apply_aim(&mut report, 25_000);
     assert_eq!(axis(&report, 8), 0);
     assert_eq!(report[1] >> 2, 9);
     assert!(decode(0x45, &[0; 16]).is_none());
+}
+
+#[test]
+fn feedback_tracks_left_directions_right_swipes_and_physical_pad_clicks() {
+    let mut feedback = PadFeedback::default();
+    let mut input = Input {
+        left_pad: Pad {
+            position: Stick { x: 12_000, y: 0 },
+            touched: true,
+        },
+        right_pad: Pad {
+            position: Stick { x: 0, y: 0 },
+            touched: true,
+        },
+        ..Input::default()
+    };
+    feedback.update(&input, 0);
+    assert_eq!(feedback.take(0), [Some(PadEffect::Tick), None]);
+    feedback.update(&input, 10_000);
+    assert_eq!(feedback.take(10_000), [None, None]);
+
+    input.left_pad.position.x = -12_000;
+    input.right_pad.position.x = 20;
+    feedback.update(&input, 20_000);
+    assert_eq!(feedback.take(20_000), [Some(PadEffect::Tick), None]);
+    input.right_pad.position.x = 1_200;
+    feedback.update(&input, 30_000);
+    assert_eq!(feedback.take(30_000), [None, Some(PadEffect::Tick)]);
+    input.right_pad.position.x = 2_500;
+    feedback.update(&input, 40_000);
+    assert_eq!(feedback.take(40_000), [None, None]);
+
+    input.buttons = (1 << 22) | (1 << 26);
+    feedback.update(&input, 50_000);
+    assert_eq!(
+        feedback.take(50_000),
+        [Some(PadEffect::Click), Some(PadEffect::Click)]
+    );
+    feedback.update(&input, 60_000);
+    assert_eq!(feedback.take(60_000), [None, None]);
+    input.right_pad.touched = false;
+    feedback.update(&input, 120_000);
+    input.right_pad.touched = true;
+    input.right_pad.position.x = -15_000;
+    feedback.update(&input, 130_000);
+    assert_eq!(feedback.take(130_000), [None, None]);
+}
+
+#[test]
+fn feedback_drops_stale_events_instead_of_playing_them_late() {
+    let mut feedback = PadFeedback::default();
+    feedback.update(
+        &Input {
+            buttons: 1 << 22,
+            ..Input::default()
+        },
+        0,
+    );
+    assert_eq!(feedback.take(80_000), [None, None]);
 }

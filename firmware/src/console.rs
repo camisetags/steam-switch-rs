@@ -4,6 +4,7 @@
 //! esp-cpp/espp Switch2Pro component. See console/LICENSE-espp.
 
 mod protocol;
+mod timing;
 
 use std::ffi::{CStr, c_void};
 use std::ptr::{null, null_mut};
@@ -19,6 +20,7 @@ use esp32_nimble::utilities::BleUuid;
 
 use crate::State;
 use protocol::{Command, PairingKey, Protocol};
+use timing::ReportPacer;
 
 const NO_CONNECTION: u16 = u16::MAX;
 const BLE_HS_FOREVER: i32 = i32::MAX; // NimBLE's indefinite duration sentinel.
@@ -182,9 +184,57 @@ pub struct Console {
     wake_until: Option<Instant>,
     wake_advertisement: bool,
     next_adv_attempt: Instant,
-    next_report: Instant,
+    pacer: ReportPacer,
+    stream: StreamStats,
     last_handle: u16,
     sequence: u8,
+}
+
+#[derive(Default)]
+struct StreamStats {
+    period_us: u64,
+    since_us: u64,
+    last_us: u64,
+    sent: u32,
+    late: u32,
+    busy_retries: u32,
+}
+
+impl StreamStats {
+    fn update_period(&mut self, now_us: u64, period_us: u64) {
+        if self.period_us != period_us {
+            log::info!("Switch BLE interval: {period_us} us");
+            *self = Self {
+                period_us,
+                since_us: now_us,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn sent(&mut self, now_us: u64) {
+        if self.last_us != 0 && now_us - self.last_us >= self.period_us * 3 / 2 {
+            self.late += 1;
+        }
+        self.last_us = now_us;
+        self.sent += 1;
+    }
+
+    fn log_window(&mut self, now_us: u64) {
+        let elapsed = now_us - self.since_us;
+        if elapsed >= 5_000_000 {
+            let rate = u64::from(self.sent) * 1_000_000 / elapsed;
+            log::info!(
+                "Switch input: {rate} reports/s, {} long gaps, {} busy retries",
+                self.late,
+                self.busy_retries,
+            );
+            self.since_us = now_us;
+            self.sent = 0;
+            self.late = 0;
+            self.busy_retries = 0;
+        }
+    }
 }
 
 impl Console {
@@ -222,7 +272,8 @@ impl Console {
             wake_until: None,
             wake_advertisement: false,
             next_adv_attempt: now,
-            next_report: now,
+            pacer: ReportPacer::default(),
+            stream: StreamStats::default(),
             last_handle: NO_CONNECTION,
             sequence: 0,
         };
@@ -244,7 +295,8 @@ impl Console {
         let now = Instant::now();
         let handle = callbacks.connection.load(Relaxed);
         if handle != self.last_handle {
-            self.next_report = now;
+            self.pacer = ReportPacer::default();
+            self.stream = StreamStats::default();
             self.sequence = 0;
             self.last_handle = handle;
         }
@@ -271,16 +323,18 @@ impl Console {
             self.wake_until = None;
         }
 
-        if !callbacks.state.console_streaming.load(Relaxed) || now < self.next_report {
+        let now_us = crate::runtime::now();
+        if !callbacks.state.console_streaming.load(Relaxed) || !self.pacer.due(now_us) {
             return Ok(());
         }
         let Some(desc) = connection(handle) else {
             return Ok(());
         };
-        let interval = Duration::from_micros(u64::from(desc.conn_itvl.max(4)) * 1_250);
-        let next = self.next_report + interval;
-        self.next_report = if next > now { next } else { now + interval };
+        let interval_us = u64::from(desc.conn_itvl.max(4)) * 1_250;
+        self.stream.update_period(now_us, interval_us);
+        self.stream.log_window(now_us);
         if !has_mbuf_headroom() {
+            self.stream.busy_retries += 1;
             return Ok(());
         }
         let mut report = *callbacks.state.report.lock().unwrap();
@@ -294,6 +348,10 @@ impl Console {
         }
         if notify(handle, INPUT_HANDLE, &report) == 0 {
             self.sequence = self.sequence.wrapping_add(1);
+            self.pacer.sent(now_us, interval_us);
+            self.stream.sent(now_us);
+        } else {
+            self.stream.busy_retries += 1;
         }
         Ok(())
     }

@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use controller_core::input::PadEffect;
 use esp_idf_svc::hal::task::asynch::Notification;
 use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
@@ -33,8 +34,10 @@ const INPUT_47: BleUuid = uuid128!("100f6c7c-1735-4313-b402-38567131e5f3");
 const FEATURES: BleUuid = uuid128!("100f6c34-1735-4313-b402-38567131e5f3");
 const BATTERY: BleUuid = uuid128!("100f6c78-1735-4313-b402-38567131e5f3");
 const HAPTICS: BleUuid = uuid128!("100f6cb5-1735-4313-b402-38567131e5f3");
+const PAD_HAPTICS: BleUuid = uuid128!("100f6cb7-1735-4313-b402-38567131e5f3");
 const HID: BleUuid = BleUuid::Uuid16(0x1812);
 const HID_REPORT: BleUuid = BleUuid::Uuid16(0x2a4d);
+const REPORT_REFERENCE: BleUuid = BleUuid::Uuid16(0x2908);
 
 const KEEPALIVE: Duration = Duration::from_millis(2200);
 const RUMBLE_REFRESH: Duration = Duration::from_millis(25);
@@ -43,6 +46,7 @@ const POLL: Duration = Duration::from_millis(10);
 struct Controller {
     features: BLERemoteCharacteristic,
     haptics: Option<BLERemoteCharacteristic>,
+    pad_haptics: Option<BLERemoteCharacteristic>,
 }
 
 fn monotonic_us() -> u64 {
@@ -75,6 +79,13 @@ async fn attach(client: &mut BLEClient, state: &Arc<State>) -> Result<Controller
         .context("Steam Controller feature report")?
         .clone();
     let haptics = valve.get_characteristic(HAPTICS).await.ok().cloned();
+    // Valve's dedicated BLE report IDs are offset by 0x35 in their UUIDs.
+    let mut pad_haptics = valve
+        .get_characteristic(PAD_HAPTICS)
+        .await
+        .ok()
+        .filter(|report| report.can_write_no_response())
+        .cloned();
 
     let mut reports = valve.get_characteristics().await?;
     let report = reports
@@ -106,11 +117,17 @@ async fn attach(client: &mut BLEClient, state: &Arc<State>) -> Result<Controller
     if let Ok(hid) = client.get_service(HID).await {
         match hid.get_characteristics().await {
             Ok(reports) => {
-                for report in
-                    reports.filter(|report| report.uuid() == HID_REPORT && report.can_notify())
-                {
-                    if subscribe(report).await.is_ok() {
-                        subscriptions += 1;
+                for report in reports.filter(|report| report.uuid() == HID_REPORT) {
+                    if report.can_notify() {
+                        if subscribe(report).await.is_ok() {
+                            subscriptions += 1;
+                        }
+                    } else if pad_haptics.is_none()
+                        && report.can_write_no_response()
+                        && let Ok(reference) = report.get_descriptor(REPORT_REFERENCE).await
+                        && reference.read_value().await.is_ok_and(|id| id == [0x82, 2])
+                    {
+                        pad_haptics = Some(report.clone());
                     }
                 }
             }
@@ -122,36 +139,46 @@ async fn attach(client: &mut BLEClient, state: &Arc<State>) -> Result<Controller
     anyhow::ensure!(client.connected(), "Steam Controller detached during setup");
     state.steam_connected.store(true, Ordering::Release);
     log::info!("Steam Controller ready, input 0x{id:02x}, {subscriptions} HID subscriptions");
-    Ok(Controller { features, haptics })
-}
-
-fn settle_speed(client: &mut BLEClient, attempted: &mut usize) {
-    const RANGES: [(u16, u16); 3] = [(6, 6), (6, 12), (12, 24)];
-    let Some(&(min, max)) = RANGES.get(*attempted) else {
-        return;
-    };
-    if client.desc().is_ok_and(|link| link.interval() <= 6) {
-        *attempted = RANGES.len();
+    if let Some(report) = pad_haptics.as_ref() {
+        log::info!("Steam trackpad haptics ready ({:?})", report.uuid());
     } else {
-        if let Err(error) = client.update_conn_params(min, max, 0, 400) {
-            log::debug!("Steam Controller interval request failed: {error}");
-        }
-        *attempted += 1;
+        log::warn!("Steam trackpad haptic output report 0x82 was not found");
     }
+    Ok(Controller {
+        features,
+        haptics,
+        pad_haptics,
+    })
 }
 
 fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -> Result<()> {
     let mut last_feature = Instant::now();
     let mut last_rumble = Instant::now();
     let mut previous_rumble = (0, 0);
-    let mut last_interval_request = Instant::now();
+    let mut last_interval_check = Instant::now();
     let mut attempts = 0;
     let mut feature_failures = 0;
+    let mut next_pad_tick = [0; 2];
+    let mut pad_write_backoff = 0;
+    let mut first_pad_write = true;
+    let mut last_link_interval = None;
     while client.connected() {
         let now = Instant::now();
-        if now.duration_since(last_interval_request) >= Duration::from_secs(1) {
-            settle_speed(client, &mut attempts);
-            last_interval_request = now;
+        if now.duration_since(last_interval_check) >= Duration::from_secs(1) {
+            if let Ok(link) = client.desc() {
+                let interval = link.interval();
+                if last_link_interval != Some(interval) {
+                    last_link_interval = Some(interval);
+                    log::info!("Steam BLE interval: {} us", u32::from(interval) * 1250);
+                }
+                if let Some(target) = wire::faster_interval(interval, attempts) {
+                    if let Err(error) = client.update_conn_params(target, target, 0, 400) {
+                        log::debug!("Steam Controller interval request failed: {error}");
+                    }
+                    attempts += 1;
+                }
+            }
+            last_interval_check = now;
         }
         if now.duration_since(last_feature) >= KEEPALIVE {
             match block_on(set_feature(&mut controller.features, &wire::LIZARD_OFF)) {
@@ -167,7 +194,8 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
             last_feature = now;
         }
 
-        let rumble = state.pending_rumble(monotonic_us());
+        let time = monotonic_us();
+        let rumble = state.pending_rumble(time);
         let refresh = rumble != (0, 0) && now.duration_since(last_rumble) >= RUMBLE_REFRESH;
         if let Some(output) = controller.haptics.as_mut()
             && (rumble != previous_rumble || refresh)
@@ -178,6 +206,33 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
             match block_on(output.write_value(&bytes, false)) {
                 Ok(()) => previous_rumble = rumble,
                 Err(error) => log::debug!("Steam Controller rumble write failed: {error}"),
+            }
+        }
+        if let Some(output) = controller.pad_haptics.as_mut()
+            && time >= pad_write_backoff
+        {
+            let effects = state.take_pad_feedback(time);
+            for (side, (effect, next_tick)) in
+                effects.into_iter().zip(&mut next_pad_tick).enumerate()
+            {
+                if let Some(effect) = effect
+                    && (effect == PadEffect::Click || time >= *next_tick)
+                {
+                    match block_on(output.write_value(&wire::pad_effect(side == 1, effect), false))
+                    {
+                        Ok(()) => {
+                            *next_tick = time + 50_000;
+                            if std::mem::take(&mut first_pad_write) {
+                                log::info!("Steam trackpad haptic command sent");
+                            }
+                        }
+                        Err(error) => {
+                            pad_write_backoff = time + 500_000;
+                            log::debug!("Steam trackpad haptic write failed: {error}");
+                            break;
+                        }
+                    }
+                }
             }
         }
         thread::sleep(POLL);
@@ -268,6 +323,16 @@ pub fn run(device: &BLEDevice, state: Arc<State>, nvs: EspDefaultNvsPartition) -
         };
 
         let mut client = device.new_client();
+        // Request a gamepad-rate connection from the outset. A later update
+        // can be delayed while the controller negotiates its own interval.
+        client.set_connection_params(
+            wire::FAST_INTERVAL_MIN,
+            wire::FAST_INTERVAL_MAX,
+            0,
+            400,
+            0x10,
+            0x10,
+        );
         let disconnect_state = Arc::clone(&state);
         let disconnected = Arc::new(Notification::new());
         let link_notice = Arc::clone(&disconnected);

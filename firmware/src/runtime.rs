@@ -1,7 +1,7 @@
 use crate::{console::Console, macros_web, steam};
 use anyhow::{Context, Result};
 use controller_core::{
-    input::{self, Battery, Mapper},
+    input::{self, Battery, Mapper, PadEffect, PadFeedback},
     macros::MacroEngine,
     motion::Motion,
 };
@@ -24,17 +24,31 @@ pub(crate) fn now() -> u64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
 }
 
-#[derive(Default)]
 struct Source {
     mapper: Mapper,
     motion: Motion,
     battery: Battery,
     wake_buttons: u32,
+    live: [u8; 63],
+    pad_feedback: PadFeedback,
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        let battery = Battery::default();
+        Self {
+            mapper: Mapper::default(),
+            motion: Motion::default(),
+            battery,
+            wake_buttons: 0,
+            live: input::neutral(battery),
+            pad_feedback: PadFeedback::default(),
+        }
+    }
 }
 
 pub(crate) struct State {
     source: Mutex<Source>,
-    live: Mutex<[u8; 63]>,
     pub report: Mutex<[u8; 63]>,
     pub macro_engine: Mutex<MacroEngine>,
     pub steam_connected: AtomicBool,
@@ -49,7 +63,6 @@ impl State {
         let neutral = input::neutral(Battery::default());
         Self {
             source: Mutex::default(),
-            live: Mutex::new(neutral),
             report: Mutex::new(neutral),
             macro_engine: Mutex::default(),
             steam_connected: AtomicBool::default(),
@@ -69,13 +82,13 @@ impl State {
             self.wake_requested.store(true, Relaxed);
         }
         source.wake_buttons = input.buttons;
+        source.pad_feedback.update(&input, time);
         let battery = source.battery;
         let mut report = source.mapper.encode(&input, battery, time);
         if let Some(imu) = input.imu {
             source.motion.apply(imu, time, &mut report);
         }
-        *self.live.lock().unwrap() = report;
-        self.macro_engine.lock().unwrap().capture(&report, time);
+        source.live = report;
     }
 
     pub fn set_battery(&self, payload: &[u8]) {
@@ -88,9 +101,7 @@ impl State {
         self.steam_connected.store(false, Relaxed);
         let mut source = self.source.lock().unwrap();
         *source = Source::default();
-        let neutral = input::neutral(source.battery);
-        *self.live.lock().unwrap() = neutral;
-        *self.report.lock().unwrap() = neutral;
+        *self.report.lock().unwrap() = source.live;
         *self.rumble.lock().unwrap() = (0, 0, 0);
     }
 
@@ -111,19 +122,34 @@ impl State {
         }
     }
 
+    pub fn take_pad_feedback(&self, time: u64) -> [Option<PadEffect>; 2] {
+        self.source.lock().unwrap().pad_feedback.take(time)
+    }
+
     fn output(&self, time: u64, select: bool) {
-        let mut live = *self.live.lock().unwrap();
+        let source = self.source.lock().unwrap();
+        let mut live = source.live;
+        source.mapper.apply_aim(&mut live, time);
+        let mut macros = self.macro_engine.lock().unwrap();
+        macros.capture(&live, time);
         if select {
             live[2] |= 0x10;
             live[3] |= 0x10;
         }
-        *self.report.lock().unwrap() = self.macro_engine.lock().unwrap().output(&live, time);
+        *self.report.lock().unwrap() = macros.output(&live, time);
     }
 }
 
 pub fn run() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // The native INFO logger prints several lines per BLE packet on the serial port.
+    unsafe {
+        esp_idf_svc::sys::esp_log_level_set(
+            c"NimBLE".as_ptr(),
+            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_WARN,
+        );
+    }
     let peripherals = Peripherals::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
     let state = Arc::new(State::new());
@@ -159,7 +185,7 @@ pub fn run() -> Result<()> {
                 if let Err(error) = console.poll() {
                     log::warn!("Switch output: {error:#}");
                 }
-                thread::sleep(Duration::from_millis(2));
+                thread::sleep(Duration::from_millis(if streaming { 1 } else { 2 }));
             }
         })
         .context("start Switch output task")?;

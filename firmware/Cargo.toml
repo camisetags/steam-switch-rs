@@ -19,3 +19,4 @@ embuild = { version = "0.33", features = ["espidf"] }
 
 [target.'cfg(not(target_os = "espidf"))'.dev-dependencies]
 aes = "0.8"
+controller-core = { path = "../crates/logic" }
