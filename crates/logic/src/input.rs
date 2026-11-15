@@ -1,6 +1,8 @@
 //! Valve BLE reports and Nintendo Pro Controller input reports.
 //! Wire layouts: SDL's Triton structures (zlib) and espp's Pro2InputReport (MIT).
 
+use crate::motion::StickGyro;
+
 pub const REPORT_LEN: usize = 63;
 pub const HOME: u8 = 16;
 const LEFT_TOUCH: u32 = 1 << 25;
@@ -262,6 +264,7 @@ pub struct Mapper {
     aim_recover_until: u64,
     aim_sample_interval: Option<u64>,
     right_stick_active: bool,
+    stick_gyro: StickGyro,
 }
 
 impl Mapper {
@@ -317,15 +320,19 @@ impl Mapper {
             1.
         };
         self.update_aim(input.right_pad, now_us);
+        self.stick_gyro
+            .update(input.imu, input.motion_aim_enabled(), now_us);
         pack(&mut report[8..11], right.map(|axis| axis * gain));
         self.apply_aim(&mut report, now_us);
         report
     }
 
-    /// Refresh the right trackpad in the latest encoded report at output time.
+    /// Refresh the virtual right stick at output time.
     pub fn apply_aim(&self, report: &mut [u8; REPORT_LEN], now_us: u64) {
         if !self.right_stick_active {
-            pack(&mut report[8..11], self.aim_at(now_us));
+            let [x, y] = self.aim_at(now_us);
+            let [yaw, pitch] = self.stick_gyro.at(now_us);
+            pack(&mut report[8..11], [x + yaw, y + pitch]);
         }
     }
 

@@ -140,6 +140,96 @@ fn only_l4_enables_motion_aim() {
     }
 }
 
+fn gyro_packet(format: u8, timestamp: u16, buttons: u32, gyro: [i16; 3]) -> Input {
+    let mut payload = [0; 45];
+    payload[1..5].copy_from_slice(&buttons.to_le_bytes());
+    let time_offset = if format == 0x47 { 31 } else { 29 };
+    payload[time_offset..time_offset + 2].copy_from_slice(&timestamp.to_le_bytes());
+    payload[37..39].copy_from_slice(&16_384i16.to_le_bytes());
+    for (bytes, value) in payload[39..45].chunks_exact_mut(2).zip(gyro) {
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+    decode(format, &payload).unwrap()
+}
+
+fn right_stick(report: &[u8; 63]) -> [u16; 2] {
+    [
+        axis(report, 8),
+        u16::from(report[9] >> 4) | (u16::from(report[10]) << 4),
+    ]
+}
+
+#[test]
+fn l4_routes_controller_rotation_to_the_regular_right_stick() {
+    let battery = Battery::default();
+    let l4 = 1 << 17;
+    for format in [0x45, 0x47] {
+        for (gyro, (x_ranges, y_ranges)) in [
+            ([0, 0, -1200], ((2300..=4095), (2048..=2048))),
+            ([0, 0, 1200], ((0..=1800), (2048..=2048))),
+            ([1200, 0, 0], ((2048..=2048), (2300..=4095))),
+            ([-1200, 0, 0], ((2048..=2048), (0..=1800))),
+            ([0, 1200, 0], ((2048..=2048), (2048..=2048))),
+        ] {
+            let mut mapper = Mapper::default();
+            let input = gyro_packet(format, 1, l4, gyro);
+            let mut report = mapper.encode(&input, battery, 10_000);
+            mapper.apply_aim(&mut report, 25_000);
+            let [x, y] = right_stick(&report);
+            assert!(
+                x_ranges.contains(&x),
+                "format {format:#x} gyro {gyro:?}: x={x}"
+            );
+            assert!(
+                y_ranges.contains(&y),
+                "format {format:#x} gyro {gyro:?}: y={y}"
+            );
+            assert_eq!(&report[5..8], &[0, 8, 128]);
+        }
+    }
+}
+
+#[test]
+fn gyro_aim_returns_to_center_on_release_and_stale_sensor_data() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    let l4 = 1 << 17;
+    let rotation = [0, 0, -1800];
+    let moving = gyro_packet(0x45, 15_000, l4, rotation);
+    let mut report = mapper.encode(&moving, battery, 15_000);
+    mapper.apply_aim(&mut report, 30_000);
+    assert!(right_stick(&report)[0] > 2300);
+
+    let mut stale = mapper.encode(&moving, battery, 110_000);
+    mapper.apply_aim(&mut stale, 120_000);
+    assert_eq!(right_stick(&stale), [2048; 2]);
+
+    let moving = gyro_packet(0x45, 30_000, l4, rotation);
+    let mut report = mapper.encode(&moving, battery, 125_000);
+    mapper.apply_aim(&mut report, 140_000);
+    assert!(right_stick(&report)[0] > 2300);
+    let released = gyro_packet(0x45, 45_000, 0, rotation);
+    let mut report = mapper.encode(&released, battery, 145_000);
+    mapper.apply_aim(&mut report, 160_000);
+    assert_eq!(right_stick(&report), [2048; 2]);
+}
+
+#[test]
+fn gyro_aim_ignores_sensor_noise_and_keeps_physical_stick_priority() {
+    let battery = Battery::default();
+    let mut mapper = Mapper::default();
+    let mut input = gyro_packet(0x45, 15_000, 1 << 17, [24, 0, -24]);
+    let mut report = mapper.encode(&input, battery, 15_000);
+    mapper.apply_aim(&mut report, 30_000);
+    assert_eq!(right_stick(&report), [2048; 2]);
+
+    input = gyro_packet(0x45, 30_000, (1 << 17) | (1 << 7), [0, 0, -1800]);
+    input.right_stick.x = i16::MIN;
+    let mut report = mapper.encode(&input, battery, 30_000);
+    mapper.apply_aim(&mut report, 45_000);
+    assert_eq!(right_stick(&report), [1229, 2048]);
+}
+
 #[test]
 fn aim_ramps_between_packets_and_settles_when_the_finger_stops() {
     let mut mapper = Mapper::default();

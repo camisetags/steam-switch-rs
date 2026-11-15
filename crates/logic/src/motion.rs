@@ -3,6 +3,75 @@
 
 use crate::input::Imu;
 
+const GYRO_DPS_PER_COUNT: f32 = 2000. / 32768.;
+const STICK_SMOOTHING_US: f32 = 10_000.;
+const STICK_HOLD_US: u64 = 25_000;
+const STICK_TIMEOUT_US: u64 = 75_000;
+const GYRO_DEADZONE_DPS: f32 = 3.;
+const GYRO_FULL_STICK_DPS: f32 = 140.;
+const MIN_STICK_DEFLECTION: f32 = 0.16;
+
+#[derive(Default)]
+pub(crate) struct StickGyro {
+    // Width, sensor timestamp, and host arrival of the last fresh sample.
+    sample: Option<(u8, u32, u64)>,
+    start: [f32; 2],
+    target: [f32; 2],
+}
+
+impl StickGyro {
+    pub(crate) fn update(&mut self, imu: Option<Imu>, held: bool, now_us: u64) {
+        if !held {
+            *self = Self::default();
+            return;
+        }
+        let Some(imu) = imu else { return };
+        if self.sample.is_some_and(|(width, timestamp, _)| {
+            width == imu.timestamp_bits && timestamp == imu.timestamp
+        }) {
+            return;
+        }
+
+        let [pitch, roll, yaw] = imu.gyro.map(|value| f32::from(value) * GYRO_DPS_PER_COUNT);
+        let [_, ay, az] = imu.accel.map(f32::from);
+        let vertical = ay.hypot(az);
+        // SDL maps Triton X to pitch and Z to yaw. Project yaw onto gravity
+        // so turning left/right also works with the controller tilted forward.
+        let yaw = if vertical > 8192. {
+            -(roll * ay + yaw * az) / vertical
+        } else {
+            -yaw
+        };
+        let speed = yaw.hypot(pitch);
+        let target = if speed <= GYRO_DEADZONE_DPS {
+            [0.; 2]
+        } else {
+            let fraction = (speed - GYRO_DEADZONE_DPS) / (GYRO_FULL_STICK_DPS - GYRO_DEADZONE_DPS);
+            // A small nonzero deflection clears the game's stick deadzone.
+            let gain = MIN_STICK_DEFLECTION + (1. - MIN_STICK_DEFLECTION) * fraction.min(1.);
+            [yaw * gain / speed, pitch * gain / speed]
+        };
+        self.start = self.at(now_us);
+        self.target = target;
+        self.sample = Some((imu.timestamp_bits, imu.timestamp, now_us));
+    }
+
+    pub(crate) fn at(&self, now_us: u64) -> [f32; 2] {
+        let Some((_, _, last_us)) = self.sample else {
+            return [0.; 2];
+        };
+        let elapsed = now_us.saturating_sub(last_us);
+        if elapsed >= STICK_TIMEOUT_US || (self.start == [0.; 2] && self.target == [0.; 2]) {
+            return [0.; 2];
+        }
+        let rise = -(-(elapsed.min(STICK_HOLD_US) as f32) / STICK_SMOOTHING_US).exp_m1();
+        let decay = (-(elapsed.saturating_sub(STICK_HOLD_US) as f32) / STICK_SMOOTHING_US).exp();
+        std::array::from_fn(|axis| {
+            (self.start[axis] + (self.target[axis] - self.start[axis]) * rise) * decay
+        })
+    }
+}
+
 pub struct Motion {
     attitude: [f32; 4],
     reported_attitude: [f32; 4],
@@ -102,7 +171,7 @@ impl Motion {
     }
 
     fn integrate(&mut self, gyro: [i16; 3], accel: [f32; 3], dt: f32) {
-        let mut angular = gyro.map(|v| (f32::from(v) * 2000. / 32768.).to_radians());
+        let mut angular = gyro.map(|v| (f32::from(v) * GYRO_DPS_PER_COUNT).to_radians());
         let gravity = norm(accel);
         if (0.96..1.04).contains(&gravity) && norm(angular) < 0.025 {
             for (estimate, sample) in self.bias.iter_mut().zip(angular) {
