@@ -11,10 +11,11 @@ const R4: u32 = 1 << 7;
 const L4: u32 = 1 << 17;
 const LOWER_PADDLES: u32 = (1 << 8) | (1 << 18); // R5 and L5
 const LEFT_PAD_CENTER: u32 = 8192;
-const AIM_SMOOTHING_US: f32 = 10_000.;
+pub(crate) const AIM_SMOOTHING_US: f32 = 10_000.;
 const AIM_RECOVERY_SMOOTHING_US: f32 = 24_000.;
 const AIM_RECOVERY_WINDOW_US: u64 = 60_000;
-const AIM_HOLD_US: u64 = 35_000;
+const AIM_RECOVERY_GAP_US: u64 = 35_000;
+const AIM_PREDICTION_US: u64 = 45_000;
 const AIM_RESET_US: u64 = 100_000;
 const AIM_BURST_US: u64 = 5_000;
 const AIM_NOMINAL_SAMPLE_US: u64 = 15_000;
@@ -256,6 +257,33 @@ fn pack(dst: &mut [u8], axes: [f32; 2]) {
     dst.copy_from_slice(&[x as u8, ((x >> 8) | (y << 4)) as u8, (y >> 4) as u8]);
 }
 
+pub(crate) fn predict_aim(
+    start: [f32; 2],
+    target: [f32; 2],
+    elapsed_us: u64,
+    smoothing_us: f32,
+) -> [f32; 2] {
+    if start == [0.; 2] && target == [0.; 2] {
+        return [0.; 2];
+    }
+    // Follow the last measured velocity through a short Bluetooth gap.
+    // Fade toward neutral once the sample is too old to keep predicting.
+    let rise = -(-(elapsed_us.min(AIM_PREDICTION_US) as f32) / smoothing_us).exp_m1();
+    let decay = (-(elapsed_us.saturating_sub(AIM_PREDICTION_US) as f32) / AIM_SMOOTHING_US).exp();
+    std::array::from_fn(|axis| (start[axis] + (target[axis] - start[axis]) * rise) * decay)
+}
+
+pub(crate) fn reconcile_aim(start: [f32; 2], target: [f32; 2]) -> [f32; 2] {
+    // A measured reversal cancels the prediction on that axis immediately.
+    std::array::from_fn(|axis| {
+        if start[axis] * target[axis] < 0. {
+            0.
+        } else {
+            start[axis]
+        }
+    })
+}
+
 #[derive(Default)]
 pub struct Mapper {
     previous_aim: Option<(Stick, u64)>,
@@ -344,21 +372,12 @@ impl Mapper {
         if elapsed >= AIM_RESET_US {
             return [0.; 2];
         }
-        if self.aim_start == [0.; 2] && self.aim_target == [0.; 2] {
-            return [0.; 2];
-        }
-        // Reconstruct the same curve regardless of how often the console polls.
-        // If input stalls, let the output decay even without a new touch sample.
         let smoothing_us = if last_us < self.aim_recover_until && self.aim_target != [0.; 2] {
             AIM_RECOVERY_SMOOTHING_US
         } else {
             AIM_SMOOTHING_US
         };
-        let rise = -(-(elapsed.min(AIM_HOLD_US) as f32) / smoothing_us).exp_m1();
-        let decay = (-(elapsed.saturating_sub(AIM_HOLD_US) as f32) / AIM_SMOOTHING_US).exp();
-        std::array::from_fn(|i| {
-            (self.aim_start[i] + (self.aim_target[i] - self.aim_start[i]) * rise) * decay
-        })
+        predict_aim(self.aim_start, self.aim_target, elapsed, smoothing_us)
     }
 
     fn update_aim(&mut self, pad: Pad, now_us: u64) {
@@ -372,7 +391,7 @@ impl Mapper {
             return;
         };
         let observed_us = now.saturating_sub(then);
-        if observed_us >= AIM_HOLD_US {
+        if observed_us >= AIM_RECOVERY_GAP_US {
             self.aim_recover_until = now + AIM_RECOVERY_WINDOW_US;
         }
         if observed_us >= AIM_RESET_US {
@@ -399,5 +418,6 @@ impl Mapper {
         let speed = distance * 1_000_000. / sample_us as f32;
         let strength = 0.15 + 0.85 * (speed / 500_000.).min(1.);
         self.aim_target = [dx * strength / distance, dy * strength / distance];
+        self.aim_start = reconcile_aim(start, self.aim_target);
     }
 }

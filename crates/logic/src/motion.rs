@@ -1,12 +1,10 @@
 //! Switch 2 30-byte motion carrier. Wire layout and quantization reference:
 //! PicoSwitch2, `ns2_motion_pdu.c` and `ns2_ds5_motion.c` (Apache-2.0).
 
-use crate::input::Imu;
+use crate::input::{AIM_SMOOTHING_US, Imu, predict_aim, reconcile_aim};
 
 const GYRO_DPS_PER_COUNT: f32 = 2000. / 32768.;
-const STICK_SMOOTHING_US: f32 = 10_000.;
-const STICK_HOLD_US: u64 = 25_000;
-const STICK_TIMEOUT_US: u64 = 75_000;
+const STICK_TIMEOUT_US: u64 = 95_000;
 const GYRO_DEADZONE_DPS: f32 = 3.;
 const GYRO_FULL_STICK_DPS: f32 = 140.;
 const MIN_STICK_DEFLECTION: f32 = 0.16;
@@ -51,7 +49,7 @@ impl StickGyro {
             let gain = MIN_STICK_DEFLECTION + (1. - MIN_STICK_DEFLECTION) * fraction.min(1.);
             [yaw * gain / speed, pitch * gain / speed]
         };
-        self.start = self.at(now_us);
+        self.start = reconcile_aim(self.at(now_us), target);
         self.target = target;
         self.sample = Some((imu.timestamp_bits, imu.timestamp, now_us));
     }
@@ -61,14 +59,10 @@ impl StickGyro {
             return [0.; 2];
         };
         let elapsed = now_us.saturating_sub(last_us);
-        if elapsed >= STICK_TIMEOUT_US || (self.start == [0.; 2] && self.target == [0.; 2]) {
+        if elapsed >= STICK_TIMEOUT_US {
             return [0.; 2];
         }
-        let rise = -(-(elapsed.min(STICK_HOLD_US) as f32) / STICK_SMOOTHING_US).exp_m1();
-        let decay = (-(elapsed.saturating_sub(STICK_HOLD_US) as f32) / STICK_SMOOTHING_US).exp();
-        std::array::from_fn(|axis| {
-            (self.start[axis] + (self.target[axis] - self.start[axis]) * rise) * decay
-        })
+        predict_aim(self.start, self.target, elapsed, AIM_SMOOTHING_US)
     }
 }
 

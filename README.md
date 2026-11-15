@@ -6,7 +6,7 @@ A Rust firmware project for an ESP32-S3 that connects a Steam Controller (2026) 
 - Hold R4 for 40% of the physical right stick's range or L4 for 50%. Holding both uses 40%. Release both to restore full range. L5 and R5 are disabled.
 - With the game's motion aiming setting off, hold L4 to steer the right stick by rotating the controller. Release L4 to reposition the controller.
 - Touching the left trackpad away from its center presses one of the four D-pad directions. The right trackpad steers the camera while the finger moves, smoothing the transitions in stick deflection. The physical D-pad and right stick take priority over their trackpad counterparts.
-- The right trackpad eases back into motion after a gap in Bluetooth input and uses its recent sample cadence when reports arrive together.
+- The right trackpad and gyro estimate camera movement for up to 45 ms after the latest sample, then fade toward center. Releasing the touchpad or L4 clears that source immediately. The right trackpad uses its recent sample cadence when reports arrive together.
 - Trackpad feedback uses short, local ticks for D-pad directions and camera swipes, and a stronger pulse for a physical trackpad click.
 - The firmware implements console input reports, motion, battery level, rumble, pairing, and reconnect. The local web editor records, edits, saves and plays controller macros.
 

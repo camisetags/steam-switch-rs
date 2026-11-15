@@ -231,6 +231,45 @@ fn gyro_aim_ignores_sensor_noise_and_keeps_physical_stick_priority() {
 }
 
 #[test]
+fn gyro_keeps_the_measured_rotation_through_a_short_gap() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    let l4 = 1 << 17;
+    let mut report = [0; 63];
+    for time in [15_000, 30_000, 45_000, 60_000, 75_000] {
+        let input = gyro_packet(0x45, time as u16, l4, [0, 0, -1200]);
+        report = mapper.encode(&input, battery, time);
+    }
+    mapper.apply_aim(&mut report, 90_000);
+    let steady = axis(&report, 8);
+    let duplicate = gyro_packet(0x45, 75_000u32 as u16, l4, [0, 0, -1200]);
+    report = mapper.encode(&duplicate, battery, 120_000);
+    assert!(steady > 2300);
+    assert!(axis(&report, 8).abs_diff(steady) <= 30);
+    mapper.apply_aim(&mut report, 145_000);
+    assert!((2049..steady).contains(&axis(&report, 8)));
+    mapper.apply_aim(&mut report, 175_000);
+    assert_eq!(right_stick(&report), [2048; 2]);
+}
+
+#[test]
+fn gyro_drops_the_prediction_immediately_when_rotation_reverses() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    let l4 = 1 << 17;
+    let right = gyro_packet(0x45, 15_000, l4, [0, 0, -2500]);
+    let mut report = mapper.encode(&right, battery, 15_000);
+    mapper.apply_aim(&mut report, 50_000);
+    assert!(axis(&report, 8) > 2200);
+
+    let left = gyro_packet(0x45, 55_000, l4, [0, 0, 2500]);
+    let mut report = mapper.encode(&left, battery, 55_000);
+    assert_eq!(axis(&report, 8), 2048);
+    mapper.apply_aim(&mut report, 56_000);
+    assert!(axis(&report, 8) < 2048);
+}
+
+#[test]
 fn aim_ramps_between_packets_and_settles_when_the_finger_stops() {
     let mut mapper = Mapper::default();
     let battery = Battery::default();
@@ -296,6 +335,45 @@ fn right_pad_keeps_the_steady_gain_and_clears_after_release_or_a_packet_gap() {
 }
 
 #[test]
+fn right_pad_keeps_steady_speed_across_a_short_gap_and_resumes_without_a_jump() {
+    let battery = Battery::default();
+    for format in [0x45, 0x47] {
+        let mut mapper = Mapper::default();
+        let mut report = [0; 63];
+        for i in 0..=8 {
+            let time = 100_000 + u64::try_from(i).unwrap() * 15_000;
+            report = mapper.encode(&packet(i * 600, true, format), battery, time);
+        }
+        let steady = axis(&report, 8);
+        mapper.apply_aim(&mut report, 265_000);
+        assert!((2480..=2500).contains(&steady));
+        assert!(axis(&report, 8).abs_diff(steady) <= 8);
+
+        let mut resumed = mapper.encode(&packet(5400, true, format), battery, 265_000);
+        assert_eq!(axis(&resumed, 8), axis(&report, 8));
+        mapper.apply_aim(&mut resumed, 280_000);
+        assert!((2400..steady).contains(&axis(&resumed, 8)));
+    }
+}
+
+#[test]
+fn right_pad_prediction_lets_a_direction_change_or_release_take_over() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    mapper.encode(&packet(0, true, 0x45), battery, 100_000);
+    let mut report = mapper.encode(&packet(2000, true, 0x45), battery, 115_000);
+    mapper.apply_aim(&mut report, 150_000);
+    assert!(axis(&report, 8) > 2450);
+
+    let mut report = mapper.encode(&packet(0, true, 0x45), battery, 150_000);
+    assert_eq!(axis(&report, 8), 2048);
+    mapper.apply_aim(&mut report, 151_000);
+    assert!(axis(&report, 8) < 2048);
+    let released = mapper.encode(&packet(0, false, 0x45), battery, 152_000);
+    assert_eq!(right_stick(&released), [2048; 2]);
+}
+
+#[test]
 fn aim_resumes_gradually_after_a_bluetooth_gap() {
     let battery = Battery::default();
     let mut normal = Mapper::default();
@@ -314,11 +392,12 @@ fn aim_resumes_gradually_after_a_bluetooth_gap() {
             assert_eq!(axis(&report, 8), 2048);
         }
         report = recovering.encode(&packet(3_000, true, 0x45), battery, resumed_at + 15_000);
+        let before_recovery = axis(&report, 8);
         recovering.apply_aim(&mut report, resumed_at + 20_000);
-        let first_step = axis(&report, 8) - 2048;
+        let first_step = axis(&report, 8) - before_recovery;
         assert!(first_step > 0 && first_step * 3 < normal_step * 2);
         recovering.apply_aim(&mut report, resumed_at + 30_000);
-        assert!(axis(&report, 8) - 2048 > first_step);
+        assert!(axis(&report, 8) - before_recovery > first_step);
     }
 }
 
