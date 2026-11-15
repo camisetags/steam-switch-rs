@@ -5,8 +5,9 @@ pub const REPORT_LEN: usize = 63;
 pub const HOME: u8 = 16;
 const LEFT_TOUCH: u32 = 1 << 25;
 const RIGHT_TOUCH: u32 = 1 << 21;
-const LEFT_STICK_PRECISION_PADDLES: u32 = (1 << 8) | (1 << 18); // R5 and L5
-const LEFT_STICK_PRECISION_GAIN: f32 = 0.5;
+const RIGHT_STICK_PRECISION_PADDLES: u32 = (1 << 7) | (1 << 17); // R4 and L4
+const LOWER_PADDLES: u32 = (1 << 8) | (1 << 18); // R5 and L5
+const RIGHT_STICK_PRECISION_GAIN: f32 = 0.5;
 const LEFT_PAD_CENTER: u32 = 8192;
 const AIM_SMOOTHING_US: f32 = 10_000.;
 const AIM_RECOVERY_SMOOTHING_US: f32 = 24_000.;
@@ -50,6 +51,10 @@ pub struct Input {
 }
 
 impl Input {
+    pub fn wake_buttons(&self) -> u32 {
+        self.buttons & !(RIGHT_STICK_PRECISION_PADDLES | LOWER_PADDLES)
+    }
+
     fn pad_direction(&self) -> u8 {
         if !self.left_pad.touched || self.buttons & (0x0f << 10) != 0 {
             return 0;
@@ -267,7 +272,7 @@ impl Mapper {
             Some((4, 2)),
             Some((2, 128)),
             Some((2, 64)),
-            Some((4, 4)),
+            None, // R4: right-stick precision
             None,
             Some((2, 16)),
             Some((3, 1)),
@@ -277,7 +282,7 @@ impl Mapper {
             Some((3, 64)),
             Some((3, 128)),
             Some((4, 1)),
-            Some((4, 8)),
+            None, // L4: right-stick precision
             None,
             Some((3, 16)),
             None,
@@ -297,13 +302,12 @@ impl Mapper {
             }
         }
         report[3] |= input.pad_direction();
-        let mut left = axes(input.left_stick);
-        if input.buttons & LEFT_STICK_PRECISION_PADDLES != 0 {
-            left = left.map(|axis| axis * LEFT_STICK_PRECISION_GAIN);
-        }
-        pack(&mut report[5..8], left);
-        let right = axes(input.right_stick);
+        pack(&mut report[5..8], axes(input.left_stick));
+        let mut right = axes(input.right_stick);
         self.right_stick_active = right != [0.; 2];
+        if input.buttons & RIGHT_STICK_PRECISION_PADDLES != 0 {
+            right = right.map(|axis| axis * RIGHT_STICK_PRECISION_GAIN);
+        }
         self.update_aim(input.right_pad, now_us);
         pack(&mut report[8..11], right);
         self.apply_aim(&mut report, now_us);

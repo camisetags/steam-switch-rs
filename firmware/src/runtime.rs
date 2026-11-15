@@ -86,10 +86,11 @@ impl State {
             return;
         };
         let mut source = self.source.lock().unwrap();
-        if input.buttons & !source.wake_buttons != 0 && !self.console_connected.load(Relaxed) {
+        let wake_buttons = input.wake_buttons();
+        if wake_buttons & !source.wake_buttons != 0 && !self.console_connected.load(Relaxed) {
             self.wake_requested.store(true, Relaxed);
         }
-        source.wake_buttons = input.buttons;
+        source.wake_buttons = wake_buttons;
         source.pad_feedback.update(&input, time);
         if let Some(trace) = &mut source.aim_diagnostics
             && self.console_streaming.load(Relaxed)

@@ -62,28 +62,63 @@ fn left_pad_uses_cardinal_dpad_buttons_and_leaves_the_stick_separate() {
 }
 
 #[test]
-fn either_lower_paddle_halves_the_left_stick_until_released() {
+fn either_upper_paddle_halves_the_right_stick_until_released() {
     let mut mapper = Mapper::default();
     let mut payload = [0; 45];
     payload[9..11].copy_from_slice(&i16::MAX.to_le_bytes());
     payload[11..13].copy_from_slice(&i16::MIN.to_le_bytes());
     payload[13..15].copy_from_slice(&i16::MAX.to_le_bytes());
+    payload[15..17].copy_from_slice(&i16::MIN.to_le_bytes());
     const NORMAL: [u8; 3] = [0xff, 0x0f, 0x00];
     const HALF: [u8; 3] = [0xff, 0x0b, 0x40];
     for (paddles, expected) in [
         (0, NORMAL),
-        (1u32 << 8, HALF), // R5
-        (1 << 18, HALF),   // L5
-        ((1 << 8) | (1 << 18), HALF),
+        (1u32 << 7, HALF), // R4
+        (1 << 17, HALF),   // L4
+        ((1 << 7) | (1 << 17), HALF),
+        ((1 << 8) | (1 << 18), NORMAL), // R5 and L5
         (0, NORMAL),
     ] {
         payload[1..5].copy_from_slice(&(paddles | (1 << 13)).to_le_bytes());
         let input = decode(0x45, &payload).unwrap();
         let report = mapper.encode(&input, Battery::default(), 0);
-        assert_eq!(report[5..8], expected);
-        assert_eq!(axis(&report, 8), 4095);
+        assert_eq!(report[8..11], expected);
+        assert_eq!(report[5..8], NORMAL);
         assert_eq!(&report[2..5], &[0, 0x08, 0]); // D-pad Up
     }
+}
+
+#[test]
+fn precision_paddles_leave_trackpad_aim_at_full_sensitivity() {
+    let aim_after_swipe = |buttons| {
+        let mut mapper = Mapper::default();
+        let battery = Battery::default();
+        let mut input = packet(0, true, 0x45);
+        input.buttons |= buttons;
+        mapper.encode(&input, battery, 100_000);
+        input.right_pad.position.x = 1_500;
+        let mut report = mapper.encode(&input, battery, 115_000);
+        mapper.apply_aim(&mut report, 125_000);
+        axis(&report, 8)
+    };
+    let normal = aim_after_swipe(0);
+    assert!(normal > 2048);
+    assert_eq!(aim_after_swipe((1 << 7) | (1 << 17)), normal);
+}
+
+#[test]
+fn back_paddles_do_not_wake_the_console() {
+    let mut input = Input {
+        buttons: (1 << 8) | (1 << 18), // R5 and L5
+        ..Input::default()
+    };
+    assert_eq!(input.wake_buttons(), 0);
+
+    input.buttons |= (1 << 7) | (1 << 17); // R4 and L4
+    assert_eq!(input.wake_buttons(), 0);
+
+    input.buttons |= 1; // A
+    assert_eq!(input.wake_buttons(), 1);
 }
 
 #[test]
