@@ -7,8 +7,13 @@ const LEFT_TOUCH: u32 = 1 << 25;
 const RIGHT_TOUCH: u32 = 1 << 21;
 const LEFT_PAD_CENTER: u32 = 8192;
 const AIM_SMOOTHING_US: f32 = 10_000.;
+const AIM_RECOVERY_SMOOTHING_US: f32 = 24_000.;
+const AIM_RECOVERY_WINDOW_US: u64 = 60_000;
 const AIM_HOLD_US: u64 = 35_000;
 const AIM_RESET_US: u64 = 100_000;
+const AIM_BURST_US: u64 = 5_000;
+const AIM_NOMINAL_SAMPLE_US: u64 = 15_000;
+const AIM_MAX_REGULAR_SAMPLE_US: u64 = 25_000;
 const PAD_CLICK_MASKS: [u32; 2] = [1 << 26, 1 << 22];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -243,6 +248,8 @@ pub struct Mapper {
     previous_aim: Option<(Stick, u64)>,
     aim_start: [f32; 2],
     aim_target: [f32; 2],
+    aim_recover_until: u64,
+    aim_sample_interval: Option<u64>,
     right_stick_active: bool,
 }
 
@@ -317,7 +324,12 @@ impl Mapper {
         }
         // Reconstruct the same curve regardless of how often the console polls.
         // If input stalls, let the output decay even without a new touch sample.
-        let rise = -(-(elapsed.min(AIM_HOLD_US) as f32) / AIM_SMOOTHING_US).exp_m1();
+        let smoothing_us = if last_us < self.aim_recover_until && self.aim_target != [0.; 2] {
+            AIM_RECOVERY_SMOOTHING_US
+        } else {
+            AIM_SMOOTHING_US
+        };
+        let rise = -(-(elapsed.min(AIM_HOLD_US) as f32) / smoothing_us).exp_m1();
         let decay = (-(elapsed.saturating_sub(AIM_HOLD_US) as f32) / AIM_SMOOTHING_US).exp();
         std::array::from_fn(|i| {
             (self.aim_start[i] + (self.aim_target[i] - self.aim_start[i]) * rise) * decay
@@ -331,11 +343,19 @@ impl Mapper {
         self.aim_start = [0.; 2];
         self.aim_target = [0.; 2];
         let Some(((point, now), (old, then))) = current.zip(previous) else {
+            self.aim_recover_until = 0;
             return;
         };
-        let dt = now.saturating_sub(then);
-        if dt == 0 || dt >= AIM_RESET_US {
+        let observed_us = now.saturating_sub(then);
+        if observed_us >= AIM_HOLD_US {
+            self.aim_recover_until = now + AIM_RECOVERY_WINDOW_US;
+        }
+        if observed_us >= AIM_RESET_US {
             return;
+        }
+        if (AIM_BURST_US..=AIM_MAX_REGULAR_SAMPLE_US).contains(&observed_us) {
+            let previous = self.aim_sample_interval.unwrap_or(observed_us);
+            self.aim_sample_interval = Some((3 * previous + observed_us) / 4);
         }
         self.aim_start = start;
         let dx = f32::from(point.x) - f32::from(old.x);
@@ -344,7 +364,14 @@ impl Mapper {
         if distance < 24. {
             return;
         }
-        let speed = distance * 1_000_000. / dt as f32;
+        // Bluetooth can deliver buffered samples together. Use the usual sample
+        // interval for these arrivals so the transport doesn't amplify the swipe.
+        let sample_us = if observed_us < AIM_BURST_US {
+            self.aim_sample_interval.unwrap_or(AIM_NOMINAL_SAMPLE_US)
+        } else {
+            observed_us
+        };
+        let speed = distance * 1_000_000. / sample_us as f32;
         let strength = 0.15 + 0.85 * (speed / 500_000.).min(1.);
         self.aim_target = [dx * strength / distance, dy * strength / distance];
     }

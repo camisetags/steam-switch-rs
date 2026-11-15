@@ -127,6 +127,51 @@ fn right_pad_keeps_the_steady_gain_and_clears_after_release_or_a_packet_gap() {
 }
 
 #[test]
+fn aim_resumes_gradually_after_a_bluetooth_gap() {
+    let battery = Battery::default();
+    let mut normal = Mapper::default();
+    normal.encode(&packet(0, true, 0x45), battery, 100_000);
+    let mut moving = normal.encode(&packet(1_500, true, 0x45), battery, 115_000);
+    normal.apply_aim(&mut moving, 120_000);
+    let normal_step = axis(&moving, 8) - 2048;
+
+    for gap in [45_000, 105_000] {
+        let mut recovering = Mapper::default();
+        recovering.encode(&packet(0, true, 0x45), battery, 100_000);
+        recovering.encode(&packet(1_500, true, 0x45), battery, 115_000);
+        let resumed_at = 115_000 + gap;
+        let mut report = recovering.encode(&packet(1_500, true, 0x45), battery, resumed_at);
+        if gap == 105_000 {
+            assert_eq!(axis(&report, 8), 2048);
+        }
+        report = recovering.encode(&packet(3_000, true, 0x45), battery, resumed_at + 15_000);
+        recovering.apply_aim(&mut report, resumed_at + 20_000);
+        let first_step = axis(&report, 8) - 2048;
+        assert!(first_step > 0 && first_step * 3 < normal_step * 2);
+        recovering.apply_aim(&mut report, resumed_at + 30_000);
+        assert!(axis(&report, 8) - 2048 > first_step);
+    }
+}
+
+#[test]
+fn aim_uses_the_recent_sample_cadence_for_back_to_back_packets() {
+    let render_step = |sample_spacing: u64| {
+        let battery = Battery::default();
+        let mut mapper = Mapper::default();
+        mapper.encode(&packet(0, true, 0x45), battery, 100_000);
+        mapper.encode(&packet(0, true, 0x45), battery, 110_000);
+        let sample_time = 110_000 + sample_spacing;
+        let mut report = mapper.encode(&packet(1_500, true, 0x45), battery, sample_time);
+        mapper.apply_aim(&mut report, sample_time + 5_000);
+        axis(&report, 8)
+    };
+    let normal = render_step(10_000);
+    assert!(normal > 2048);
+    assert_eq!(render_step(500), normal);
+    assert_eq!(render_step(0), normal);
+}
+
+#[test]
 fn physical_right_stick_wins_and_unknown_battery_is_healthy() {
     let mut mapper = Mapper::default();
     let mut input = packet(0, true, 0x45);
