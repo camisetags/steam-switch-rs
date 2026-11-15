@@ -124,6 +124,23 @@ fn back_paddles_do_not_wake_the_console() {
 }
 
 #[test]
+fn only_l4_enables_motion_aim() {
+    let mut payload = [0; 45];
+    for (buttons, enabled) in [
+        (0u32, false),
+        (1 << 7, false),
+        (1 << 17, true),
+        (1 << 18, false),
+    ] {
+        payload[1..5].copy_from_slice(&buttons.to_le_bytes());
+        assert_eq!(
+            decode(0x45, &payload).unwrap().motion_aim_enabled(),
+            enabled
+        );
+    }
+}
+
+#[test]
 fn aim_ramps_between_packets_and_settles_when_the_finger_stops() {
     let mut mapper = Mapper::default();
     let battery = Battery::default();

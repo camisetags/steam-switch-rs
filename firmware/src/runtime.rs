@@ -99,9 +99,9 @@ impl State {
         }
         let battery = source.battery;
         let mut report = source.mapper.encode(&input, battery, time);
-        if let Some(imu) = input.imu {
-            source.motion.apply(imu, time, &mut report);
-        }
+        source
+            .motion
+            .apply(input.imu, input.motion_aim_enabled(), time, &mut report);
         source.live = report;
     }
 

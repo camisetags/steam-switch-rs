@@ -5,6 +5,8 @@ use crate::input::Imu;
 
 pub struct Motion {
     attitude: [f32; 4],
+    reported_attitude: [f32; 4],
+    aim_offset: Option<[f32; 4]>,
     previous: Option<(u32, u8, u64)>,
     clock_us: u64,
     chart: usize,
@@ -15,6 +17,8 @@ impl Default for Motion {
     fn default() -> Self {
         Self {
             attitude: [0., 0., 0., 1.],
+            reported_attitude: [0., 0., 0., 1.],
+            aim_offset: None,
             previous: None,
             clock_us: 0,
             chart: 0,
@@ -24,7 +28,19 @@ impl Default for Motion {
 }
 
 impl Motion {
-    pub fn apply(&mut self, imu: Imu, arrival_us: u64, report: &mut [u8; 63]) {
+    pub fn apply(
+        &mut self,
+        imu: Option<Imu>,
+        aim_enabled: bool,
+        arrival_us: u64,
+        report: &mut [u8; 63],
+    ) {
+        if !aim_enabled {
+            self.aim_offset = None;
+        }
+        let Some(imu) = imu else {
+            return;
+        };
         let accel = imu.accel.map(|v| f32::from(v) / 16384.);
         let mut elapsed = 0;
         if let Some((last_tick, width, last_arrival)) = self.previous {
@@ -46,13 +62,36 @@ impl Motion {
         if elapsed > 0 {
             self.integrate(imu.gyro, accel, elapsed as f32 / 1_000_000.);
         }
+        // On press, align the controller's current pose to the last pose
+        // reported to the console. Track the physical pose between presses.
+        let mut reported_accel = gravity_direction(self.reported_attitude);
+        if aim_enabled {
+            match self.aim_offset {
+                Some(offset) if elapsed > 0 => {
+                    self.reported_attitude = quaternion_product(offset, self.attitude);
+                    let physical_gravity = gravity_direction(self.attitude);
+                    let reported_gravity = gravity_direction(self.reported_attitude);
+                    // Retain linear acceleration with the rebased gravity.
+                    reported_accel = std::array::from_fn(|axis| {
+                        reported_gravity[axis] + (accel[axis] - physical_gravity[axis])
+                    });
+                }
+                None => {
+                    let [w, x, y, z] = self.attitude;
+                    let offset = quaternion_product(self.reported_attitude, [w, -x, -y, -z]);
+                    let length = norm(offset);
+                    self.aim_offset = Some(offset.map(|value| value / length));
+                }
+                Some(_) => {}
+            }
+        }
         let slot = self.clock_us / 1250;
         let ticks = ((slot - last_slot).min(15) as u16) << 12;
         let mut carrier = [0; 30];
         carrier[0..2].copy_from_slice(&(ticks | (slot as u16 & 0x0fff)).to_le_bytes());
         carrier[3] = 12;
         self.orientation(&mut carrier);
-        for (axis, g) in accel.into_iter().enumerate() {
+        for (axis, g) in reported_accel.into_iter().enumerate() {
             let offset = 16 + 4 * axis;
             let value = (g * 4096. * 68963.) as i32;
             carrier[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -75,11 +114,7 @@ impl Motion {
         }
         let [w, x, y, z] = self.attitude;
         if (0.92..1.08).contains(&gravity) {
-            let down = [
-                2. * (x * z - w * y),
-                2. * (w * x + y * z),
-                w * w - x * x - y * y + z * z,
-            ];
+            let down = gravity_direction(self.attitude);
             let measured = accel.map(|g| g / gravity);
             let correction = [
                 measured[1] * down[2] - measured[2] * down[1],
@@ -104,7 +139,7 @@ impl Motion {
     }
 
     fn orientation(&mut self, carrier: &mut [u8; 30]) {
-        let q = self.attitude;
+        let q = self.reported_attitude;
         const LIMIT: f32 = std::f32::consts::FRAC_1_SQRT_2;
         if (0..4).any(|i| i != self.chart && q[i].abs() > LIMIT) {
             self.chart = (0..4)
@@ -126,6 +161,23 @@ impl Motion {
     }
 }
 
+fn quaternion_product([w, x, y, z]: [f32; 4], [a, b, c, d]: [f32; 4]) -> [f32; 4] {
+    [
+        w * a - x * b - y * c - z * d,
+        w * b + x * a + y * d - z * c,
+        w * c - x * d + y * a + z * b,
+        w * d + x * c - y * b + z * a,
+    ]
+}
+
+fn gravity_direction([w, x, y, z]: [f32; 4]) -> [f32; 3] {
+    [
+        2. * (x * z - w * y),
+        2. * (w * x + y * z),
+        w * w - x * x - y * y + z * z,
+    ]
+}
+
 fn norm<const N: usize>(v: [f32; N]) -> f32 {
     v.into_iter().map(|x| x * x).sum::<f32>().sqrt()
 }
@@ -144,10 +196,10 @@ mod tests {
             timestamp: 65500,
             timestamp_bits: 16,
         };
-        motion.apply(imu, 2000, &mut report);
+        motion.apply(Some(imu), true, 2000, &mut report);
         let first = report;
         imu.timestamp = 220;
-        motion.apply(imu, 10000, &mut report);
+        motion.apply(Some(imu), true, 10000, &mut report);
         assert_eq!(report[14], 30);
         assert_ne!(report[15..17], first[15..17]);
         assert_ne!(report[19..31], first[19..31]);
@@ -155,5 +207,57 @@ mod tests {
             i32::from_le_bytes(report[39..43].try_into().unwrap()),
             4096 * 68963
         );
+    }
+
+    #[test]
+    fn holding_motion_aim_rebases_after_repositioning() {
+        let mut motion = Motion::default();
+        let mut report = [0; 63];
+        let sample = |timestamp, accel, gyro| {
+            Some(Imu {
+                accel,
+                gyro,
+                timestamp,
+                timestamp_bits: 32,
+            })
+        };
+        let up = [0, 0, 16384];
+        let tilt = [0, 3000, 0];
+        motion.apply(sample(0, up, [0; 3]), false, 0, &mut report);
+        let initial = report;
+        motion.apply(
+            sample(15_000, [4096, 0, 15863], tilt),
+            false,
+            15_000,
+            &mut report,
+        );
+        assert_eq!(report[19..44], initial[19..44]);
+        assert_ne!(report[15..17], initial[15..17]);
+
+        motion.apply(sample(30_000, up, tilt), true, 30_000, &mut report);
+        assert_eq!(report[19..44], initial[19..44]);
+        motion.apply(sample(45_000, up, tilt), true, 45_000, &mut report);
+        assert_ne!(report[19..31], initial[19..31]);
+        let aimed = report;
+
+        motion.apply(sample(60_000, up, tilt), false, 60_000, &mut report);
+        assert_eq!(report[19..31], aimed[19..31]);
+        let released = report;
+        motion.apply(
+            sample(75_000, [4096, 0, 15863], tilt),
+            false,
+            75_000,
+            &mut report,
+        );
+        assert_eq!(report[19..44], released[19..44]);
+        motion.apply(sample(90_000, up, tilt), true, 90_000, &mut report);
+        assert_eq!(report[19..44], released[19..44]);
+        motion.apply(sample(105_000, up, tilt), true, 105_000, &mut report);
+        assert_ne!(report[19..31], released[19..31]);
+
+        let before_missing_imu = report;
+        motion.apply(None, false, 110_000, &mut report);
+        motion.apply(sample(120_000, up, tilt), true, 120_000, &mut report);
+        assert_eq!(report[19..31], before_missing_imu[19..31]);
     }
 }

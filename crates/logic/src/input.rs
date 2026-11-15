@@ -55,6 +55,10 @@ impl Input {
         self.buttons & !(R4 | L4 | LOWER_PADDLES)
     }
 
+    pub fn motion_aim_enabled(&self) -> bool {
+        self.buttons & L4 != 0
+    }
+
     fn pad_direction(&self) -> u8 {
         if !self.left_pad.touched || self.buttons & (0x0f << 10) != 0 {
             return 0;
@@ -282,7 +286,7 @@ impl Mapper {
             Some((3, 64)),
             Some((3, 128)),
             Some((4, 1)),
-            None, // L4: right-stick precision
+            None, // L4: motion aim and right-stick precision
             None,
             Some((3, 16)),
             None,
