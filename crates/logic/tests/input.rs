@@ -71,12 +71,12 @@ fn right_stick_precision_uses_the_stricter_held_paddle() {
     payload[15..17].copy_from_slice(&i16::MIN.to_le_bytes());
     const NORMAL: [u8; 3] = [0xff, 0x0f, 0x00];
     const HALF: [u8; 3] = [0xff, 0x0b, 0x40];
-    const THIRTY_PERCENT: [u8; 3] = [0x66, 0x9a, 0x59];
+    const FORTY_PERCENT: [u8; 3] = [0x33, 0xdb, 0x4c];
     for (paddles, expected) in [
         (0, NORMAL),
-        (1u32 << 7, THIRTY_PERCENT), // R4
-        (1 << 17, HALF),             // L4
-        ((1 << 7) | (1 << 17), THIRTY_PERCENT),
+        (1u32 << 7, FORTY_PERCENT), // R4
+        (1 << 17, HALF),            // L4
+        ((1 << 7) | (1 << 17), FORTY_PERCENT),
         (1 << 17, HALF),
         ((1 << 8) | (1 << 18), NORMAL), // R5 and L5
         (0, NORMAL),

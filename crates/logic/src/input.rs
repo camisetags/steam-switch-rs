@@ -306,7 +306,7 @@ impl Mapper {
         let right = axes(input.right_stick);
         self.right_stick_active = right != [0.; 2];
         let gain = if input.buttons & R4 != 0 {
-            0.3
+            0.4
         } else if input.buttons & L4 != 0 {
             0.5
         } else {
