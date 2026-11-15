@@ -62,6 +62,31 @@ fn left_pad_uses_cardinal_dpad_buttons_and_leaves_the_stick_separate() {
 }
 
 #[test]
+fn either_lower_paddle_halves_the_left_stick_until_released() {
+    let mut mapper = Mapper::default();
+    let mut payload = [0; 45];
+    payload[9..11].copy_from_slice(&i16::MAX.to_le_bytes());
+    payload[11..13].copy_from_slice(&i16::MIN.to_le_bytes());
+    payload[13..15].copy_from_slice(&i16::MAX.to_le_bytes());
+    const NORMAL: [u8; 3] = [0xff, 0x0f, 0x00];
+    const HALF: [u8; 3] = [0xff, 0x0b, 0x40];
+    for (paddles, expected) in [
+        (0, NORMAL),
+        (1u32 << 8, HALF), // R5
+        (1 << 18, HALF),   // L5
+        ((1 << 8) | (1 << 18), HALF),
+        (0, NORMAL),
+    ] {
+        payload[1..5].copy_from_slice(&(paddles | (1 << 13)).to_le_bytes());
+        let input = decode(0x45, &payload).unwrap();
+        let report = mapper.encode(&input, Battery::default(), 0);
+        assert_eq!(report[5..8], expected);
+        assert_eq!(axis(&report, 8), 4095);
+        assert_eq!(&report[2..5], &[0, 0x08, 0]); // D-pad Up
+    }
+}
+
+#[test]
 fn aim_ramps_between_packets_and_settles_when_the_finger_stops() {
     let mut mapper = Mapper::default();
     let battery = Battery::default();

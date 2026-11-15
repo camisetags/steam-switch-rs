@@ -3,6 +3,7 @@
 A Rust firmware project for an ESP32-S3 that connects a Steam Controller (2026) to a Nintendo Switch 2 over Bluetooth LE. The controller is the input device and the ESP32 is the adapter.
 
 - The physical A, B, X and Y buttons follow the printed letters.
+- Hold either L5 or R5 to halve the left stick's deflection. Release both paddles to restore full range.
 - Touching the left trackpad away from its center presses one of the four D-pad directions. The right trackpad steers the camera while the finger moves, smoothing the transitions in stick deflection. The physical D-pad and right stick take priority over their trackpad counterparts.
 - The right trackpad eases back into motion after a gap in Bluetooth input and uses its recent sample cadence when reports arrive together.
 - Trackpad feedback uses short, local ticks for D-pad directions and camera swipes, and a stronger pulse for a physical trackpad click.
