@@ -5,9 +5,9 @@ pub const REPORT_LEN: usize = 63;
 pub const HOME: u8 = 16;
 const LEFT_TOUCH: u32 = 1 << 25;
 const RIGHT_TOUCH: u32 = 1 << 21;
-const RIGHT_STICK_PRECISION_PADDLES: u32 = (1 << 7) | (1 << 17); // R4 and L4
+const R4: u32 = 1 << 7;
+const L4: u32 = 1 << 17;
 const LOWER_PADDLES: u32 = (1 << 8) | (1 << 18); // R5 and L5
-const RIGHT_STICK_PRECISION_GAIN: f32 = 0.5;
 const LEFT_PAD_CENTER: u32 = 8192;
 const AIM_SMOOTHING_US: f32 = 10_000.;
 const AIM_RECOVERY_SMOOTHING_US: f32 = 24_000.;
@@ -52,7 +52,7 @@ pub struct Input {
 
 impl Input {
     pub fn wake_buttons(&self) -> u32 {
-        self.buttons & !(RIGHT_STICK_PRECISION_PADDLES | LOWER_PADDLES)
+        self.buttons & !(R4 | L4 | LOWER_PADDLES)
     }
 
     fn pad_direction(&self) -> u8 {
@@ -303,13 +303,17 @@ impl Mapper {
         }
         report[3] |= input.pad_direction();
         pack(&mut report[5..8], axes(input.left_stick));
-        let mut right = axes(input.right_stick);
+        let right = axes(input.right_stick);
         self.right_stick_active = right != [0.; 2];
-        if input.buttons & RIGHT_STICK_PRECISION_PADDLES != 0 {
-            right = right.map(|axis| axis * RIGHT_STICK_PRECISION_GAIN);
-        }
+        let gain = if input.buttons & R4 != 0 {
+            0.3
+        } else if input.buttons & L4 != 0 {
+            0.5
+        } else {
+            1.
+        };
         self.update_aim(input.right_pad, now_us);
-        pack(&mut report[8..11], right);
+        pack(&mut report[8..11], right.map(|axis| axis * gain));
         self.apply_aim(&mut report, now_us);
         report
     }
