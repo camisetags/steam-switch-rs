@@ -19,6 +19,7 @@ use esp32_nimble::enums::OwnAddrType;
 use esp32_nimble::utilities::BleUuid;
 
 use crate::State;
+use crate::aim_diagnostics::{self, OutputTrace};
 use protocol::{Command, PairingKey, Protocol};
 use timing::ReportPacer;
 
@@ -186,6 +187,7 @@ pub struct Console {
     next_adv_attempt: Instant,
     pacer: ReportPacer,
     stream: StreamStats,
+    aim_diagnostics: Option<OutputTrace>,
     last_handle: u16,
     sequence: u8,
 }
@@ -274,6 +276,7 @@ impl Console {
             next_adv_attempt: now,
             pacer: ReportPacer::default(),
             stream: StreamStats::default(),
+            aim_diagnostics: aim_diagnostics::ENABLED.then(OutputTrace::default),
             last_handle: NO_CONNECTION,
             sequence: 0,
         };
@@ -297,6 +300,7 @@ impl Console {
         if handle != self.last_handle {
             self.pacer = ReportPacer::default();
             self.stream = StreamStats::default();
+            self.aim_diagnostics = aim_diagnostics::ENABLED.then(OutputTrace::default);
             self.sequence = 0;
             self.last_handle = handle;
         }
@@ -333,8 +337,16 @@ impl Console {
         let interval_us = u64::from(desc.conn_itvl.max(4)) * 1_250;
         self.stream.update_period(now_us, interval_us);
         self.stream.log_window(now_us);
+        if let Some(trace) = &mut self.aim_diagnostics
+            && let Some((elapsed, out)) = trace.window_due(now_us)
+        {
+            callbacks.state.stage_aim_window(now_us, elapsed, out);
+        }
         if !has_mbuf_headroom() {
             self.stream.busy_retries += 1;
+            if let Some(trace) = &mut self.aim_diagnostics {
+                trace.pool_busy();
+            }
             return Ok(());
         }
         let mut report = *callbacks.state.report.lock().unwrap();
@@ -346,12 +358,19 @@ impl Console {
         } else if report[14] == 0 {
             report[14] = 40;
         }
-        if notify(handle, INPUT_HANDLE, &report) == 0 {
+        let result = notify(handle, INPUT_HANDLE, &report);
+        if result == 0 {
             self.sequence = self.sequence.wrapping_add(1);
             self.pacer.sent(now_us, interval_us);
             self.stream.sent(now_us);
+            if let Some(trace) = &mut self.aim_diagnostics {
+                trace.queued(crate::runtime::now(), &report);
+            }
         } else {
             self.stream.busy_retries += 1;
+            if let Some(trace) = &mut self.aim_diagnostics {
+                trace.rejected(result);
+            }
         }
         Ok(())
     }

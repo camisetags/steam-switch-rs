@@ -3,6 +3,8 @@ fn main() {
     eprintln!("Build from the firmware directory with cargo +esp build --release.");
 }
 
+#[cfg(any(target_os = "espidf", test))]
+mod aim_diagnostics;
 #[cfg(target_os = "espidf")]
 mod console;
 #[cfg(target_os = "espidf")]

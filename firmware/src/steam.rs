@@ -26,7 +26,7 @@ use esp32_nimble::{
     BLEAddress, BLEClient, BLEDevice, BLERemoteCharacteristic, BLEScan, utilities::BleUuid, uuid128,
 };
 
-use crate::State;
+use crate::{State, aim_diagnostics};
 
 const VALVE: BleUuid = uuid128!("100f6c32-1735-4313-b402-38567131e5f3");
 const INPUT_45: BleUuid = uuid128!("100f6c7a-1735-4313-b402-38567131e5f3");
@@ -164,6 +164,9 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
     let mut last_link_interval = None;
     while client.connected() {
         let now = Instant::now();
+        if aim_diagnostics::ENABLED {
+            state.log_aim_window();
+        }
         if now.duration_since(last_interval_check) >= Duration::from_secs(1) {
             if let Ok(link) = client.desc() {
                 let interval = link.interval();

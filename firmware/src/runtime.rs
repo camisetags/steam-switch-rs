@@ -1,4 +1,8 @@
-use crate::{console::Console, macros_web, steam};
+use crate::{
+    aim_diagnostics::{self, InputTrace, InputWindow, OutputWindow},
+    console::Console,
+    macros_web, steam,
+};
 use anyhow::{Context, Result};
 use controller_core::{
     input::{self, Battery, Mapper, PadEffect, PadFeedback},
@@ -31,6 +35,7 @@ struct Source {
     wake_buttons: u32,
     live: [u8; 63],
     pad_feedback: PadFeedback,
+    aim_diagnostics: Option<InputTrace>,
 }
 
 impl Default for Source {
@@ -43,6 +48,7 @@ impl Default for Source {
             wake_buttons: 0,
             live: input::neutral(battery),
             pad_feedback: PadFeedback::default(),
+            aim_diagnostics: aim_diagnostics::ENABLED.then(InputTrace::default),
         }
     }
 }
@@ -56,6 +62,7 @@ pub(crate) struct State {
     pub console_streaming: AtomicBool,
     pub wake_requested: AtomicBool,
     rumble: Mutex<(u16, u16, u64)>,
+    aim_window: Mutex<Option<(u64, u64, InputWindow, OutputWindow)>>,
 }
 
 impl State {
@@ -70,6 +77,7 @@ impl State {
             console_streaming: AtomicBool::default(),
             wake_requested: AtomicBool::default(),
             rumble: Mutex::default(),
+            aim_window: Mutex::default(),
         }
     }
 
@@ -83,6 +91,11 @@ impl State {
         }
         source.wake_buttons = input.buttons;
         source.pad_feedback.update(&input, time);
+        if let Some(trace) = &mut source.aim_diagnostics
+            && self.console_streaming.load(Relaxed)
+        {
+            trace.receive(time, input.right_pad);
+        }
         let battery = source.battery;
         let mut report = source.mapper.encode(&input, battery, time);
         if let Some(imu) = input.imu {
@@ -126,6 +139,38 @@ impl State {
         self.source.lock().unwrap().pad_feedback.take(time)
     }
 
+    pub fn stage_aim_window(&self, time: u64, elapsed: u64, output: OutputWindow) {
+        let input = self
+            .source
+            .lock()
+            .unwrap()
+            .aim_diagnostics
+            .as_mut()
+            .map_or_else(InputWindow::default, InputTrace::take);
+        *self.aim_window.lock().unwrap() = Some((time, elapsed, input, output));
+    }
+
+    pub fn log_aim_window(&self) {
+        let window = self.aim_window.lock().unwrap().take();
+        if let Some((time, elapsed, input, out)) = window {
+            log::info!(
+                "Aim timing: at_us={time} window_us={elapsed} rx={} touch={} move={} rx_gap_us={} touch_gap_us={} pad_step={} tx={} tx_gap_us={} stick_step={} pool_busy={} tx_errors={} last_error={}",
+                input.received,
+                input.touched,
+                input.moved,
+                input.max_gap_us,
+                input.max_touch_gap_us,
+                input.max_step,
+                out.queued,
+                out.max_gap_us,
+                out.max_step,
+                out.pool_busy,
+                out.rejected,
+                out.last_error,
+            );
+        }
+    }
+
     fn output(&self, time: u64, select: bool) {
         let source = self.source.lock().unwrap();
         let mut live = source.live;
@@ -143,6 +188,9 @@ impl State {
 pub fn run() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    if aim_diagnostics::ENABLED {
+        log::info!("Trackpad timing diagnostics enabled");
+    }
     // The native INFO logger prints several lines per BLE packet on the serial port.
     unsafe {
         esp_idf_svc::sys::esp_log_level_set(

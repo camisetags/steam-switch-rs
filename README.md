@@ -50,6 +50,8 @@ espflash flash --port PORT --monitor --flash-mode dio --flash-size 4mb \
 
 Optional build-time variables are `STEAM_CONTROLLER_MAC` (an allowlist of Bluetooth addresses separated by spaces or commas), `STEAM_SWITCH_WIFI_SSID` and `STEAM_SWITCH_WIFI_PASSWORD` (8–63 bytes). The editor uses `SteamSwitch-RS` and an open local Wi-Fi network by default. Set a password if people nearby should be unable to join. After connecting to the access point, open [the editor](http://192.168.4.1/).
 
+Build with `STEAM_SWITCH_AIM_DIAGNOSTICS=1` to log one timing summary per second over UART at 115200 baud while both Bluetooth links are active. The `rx` and `touch` counts and gaps describe Steam Controller samples. The `tx` count and gaps describe accepted NimBLE submissions to the Switch. `pool_busy` counts waits for buffer headroom, and `tx_errors` counts failed submissions. The reported stick step is the largest per-axis change between consecutive submissions in 12-bit stick counts.
+
 Pair the Steam Controller in Bluetooth mode by holding **B + R1 + Steam** from power off. On the Switch 2, open **Controllers → Change Grip/Order**. Pairing and gameplay on physical hardware are separate from the PC tests.
 
 ## Sources and licensing
