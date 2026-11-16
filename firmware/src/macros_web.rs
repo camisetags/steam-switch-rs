@@ -3,6 +3,7 @@
 use std::{
     fs::{self, File},
     io::{ErrorKind, Read as _, Write as _},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering::Relaxed},
 };
@@ -14,9 +15,14 @@ use esp_idf_svc::{
     hal::modem::WifiModemPeripheral,
     http::server::{Configuration, EspHttpConnection, EspHttpServer, Method, Request},
     io::Write as _,
+    ipv4::{Configuration as IpConfiguration, Mask, RouterConfiguration, Subnet},
+    netif::{EspNetif, NetifConfiguration, NetifStack},
     nvs::EspDefaultNvsPartition,
     sys::{self, EspError},
-    wifi::{AccessPointConfiguration, AuthMethod, Configuration as WifiConfiguration, EspWifi},
+    wifi::{
+        AccessPointConfiguration, AuthMethod, Configuration as WifiConfiguration, EspWifi,
+        WifiDriver,
+    },
 };
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::{Value, json};
@@ -27,7 +33,7 @@ const MOUNT: &str = "/macros";
 const MAX_MACROS: usize = 64;
 const EDITOR: &str = include_str!("../assets/macros.html");
 pub const SSID: &str = "SteamSwitch-RS";
-const DEFAULT_IP: &str = "192.168.4.1";
+const AP_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
 
 type HttpRequest<'request, 'connection> = Request<&'request mut EspHttpConnection<'connection>>;
 
@@ -115,7 +121,18 @@ pub fn start(
 ) -> Result<MacroWeb> {
     let storage = SpiffsMount::open()?;
     let event_loop = EspSystemEventLoop::take()?;
-    let mut wifi = EspWifi::new(modem, event_loop, Some(nvs))?;
+    let driver = WifiDriver::new(modem, event_loop, Some(nvs))?;
+    let ap = EspNetif::new_with_conf(&NetifConfiguration {
+        ip_configuration: Some(IpConfiguration::Router(RouterConfiguration {
+            subnet: Subnet {
+                gateway: AP_IP,
+                mask: Mask(24),
+            },
+            ..Default::default()
+        })),
+        ..NetifConfiguration::wifi_default_router()
+    })?;
+    let mut wifi = EspWifi::wrap_all(driver, EspNetif::new(NetifStack::Sta)?, ap)?;
     let configured_ssid = option_env!("STEAM_SWITCH_WIFI_SSID").unwrap_or(SSID);
     let password = option_env!("STEAM_SWITCH_WIFI_PASSWORD").unwrap_or("");
     if !password.is_empty() && !(8..=63).contains(&password.len()) {
@@ -184,7 +201,7 @@ pub fn start(
             }
         })?;
     }
-    log::info!("Macro editor on {configured_ssid} at http://{DEFAULT_IP}");
+    log::info!("Macro editor on {configured_ssid} at http://{AP_IP}");
     Ok(MacroWeb {
         _server: server,
         _storage: storage,
@@ -333,7 +350,7 @@ fn route(
             json!({"sc2": state.steam_connected.load(Relaxed),
                 "console": state.console_connected.load(Relaxed), "streaming": state.console_streaming.load(Relaxed),
                 "playing": status.playing, "recording": status.recording, "pos": status.pos,
-                "dur": status.dur, "rec_ms": status.rec_ms, "ip": DEFAULT_IP})
+                "dur": status.dur, "rec_ms": status.rec_ms, "ip": AP_IP})
         }
         ("/api/macros", _) => list()?,
         ("/api/macro" | "/api/download", Method::Get) => {
