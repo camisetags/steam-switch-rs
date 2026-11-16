@@ -54,11 +54,109 @@ mod tests {
         assert_eq!(idle.queued, 0);
         assert_eq!(idle.pool_busy, 0);
     }
+
+    #[test]
+    fn timings_report_mean_percentile_bounds_and_gap_thresholds() {
+        let mut timing = Timing::default();
+        for delay in [25, 100, 7_500, 24_999, 25_000, 35_000, 45_000, 100_000] {
+            timing.record(delay);
+        }
+        assert_eq!(timing.mean(), 29_703);
+        assert_eq!(timing.percentile(50), 24_999);
+        assert_eq!(timing.percentile(95), 100_000);
+        assert_eq!(timing.percentile(99), 100_000);
+        assert_eq!(timing.long_gaps(), [4, 3, 2, 1, 1]);
+    }
+
+    #[test]
+    fn sample_age_is_measured_only_for_accepted_reports_with_an_input_sample() {
+        let mut trace = OutputTrace::default();
+        trace.window_due(1000);
+        trace.attempted(1500);
+        trace.pool_busy();
+        trace.attempted(2200);
+        trace.record_submit_age(2250, Some(1000));
+        trace.attempted(3000);
+        trace.record_submit_age(3050, None);
+        let (_, window) = trace.window_due(1_001_000).unwrap();
+        assert_eq!(window.attempts, 3);
+        assert_eq!(window.attempt_gap.mean(), 750);
+        assert_eq!(window.sample_age.count, 1);
+        assert_eq!(window.sample_age.max, 1250);
+        assert_eq!(window.pool_busy, 1);
+    }
 }
+use std::fmt;
+
 use controller_core::input::{Pad, REPORT_LEN};
 
 #[cfg(target_os = "espidf")]
 pub(crate) const ENABLED: bool = option_env!("STEAM_SWITCH_AIM_DIAGNOSTICS").is_some();
+
+// Lower bounds in microseconds. The final five are the gap cutoffs in the log.
+const BUCKETS: [u64; 20] = [
+    0, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 7_500, 10_000, 12_500, 15_000, 17_500, 20_000,
+    25_000, 35_000, 45_000, 60_000, 100_000,
+];
+
+#[derive(Default)]
+pub(crate) struct Timing {
+    bins: [u32; BUCKETS.len()],
+    count: u32,
+    total: u64,
+    max: u64,
+}
+
+impl Timing {
+    pub fn record(&mut self, value: u64) {
+        let bin = BUCKETS.partition_point(|&bound| bound <= value) - 1;
+        self.bins[bin] += 1;
+        self.count += 1;
+        self.total += value;
+        self.max = self.max.max(value);
+    }
+
+    fn mean(&self) -> u64 {
+        self.total.checked_div(u64::from(self.count)).unwrap_or(0)
+    }
+
+    fn percentile(&self, percent: u32) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let rank = (self.count * percent).div_ceil(100);
+        let mut cumulative = 0;
+        for (bin, &count) in self.bins.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= rank {
+                return BUCKETS
+                    .get(bin + 1)
+                    .map_or(self.max, |&upper| self.max.min(upper - 1));
+            }
+        }
+        self.max
+    }
+
+    pub fn long_gaps(&self) -> [u32; 5] {
+        let start = BUCKETS.len() - 5;
+        std::array::from_fn(|i| self.bins[start + i..].iter().sum())
+    }
+}
+
+impl fmt::Display for Timing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}/{}/{}/{}",
+            self.count,
+            self.mean(),
+            self.percentile(50),
+            self.percentile(95),
+            self.percentile(99),
+            self.max,
+        )
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct InputWindow {
@@ -68,6 +166,24 @@ pub(crate) struct InputWindow {
     pub max_gap_us: u64,
     pub max_touch_gap_us: u64,
     pub max_step: u16,
+    pub gap: Timing,
+    pub touch_gap: Timing,
+    #[cfg(target_os = "espidf")]
+    pub decode: Timing,
+    #[cfg(target_os = "espidf")]
+    pub input_wait: Timing,
+    #[cfg(target_os = "espidf")]
+    pub input_update: Timing,
+    #[cfg(target_os = "espidf")]
+    pub output_wait: Timing,
+    #[cfg(target_os = "espidf")]
+    pub aim: Timing,
+    #[cfg(target_os = "espidf")]
+    pub aim_sample_age: Timing,
+    #[cfg(target_os = "espidf")]
+    pub macro_wait: Timing,
+    #[cfg(target_os = "espidf")]
+    pub output_work: Timing,
 }
 
 #[derive(Default)]
@@ -82,8 +198,10 @@ impl InputTrace {
         self.window.touched += u32::from(pad.touched);
         if let Some((then, previous)) = self.last.replace((time, pad)) {
             let gap = time.saturating_sub(then);
+            self.window.gap.record(gap);
             self.window.max_gap_us = self.window.max_gap_us.max(gap);
             if pad.touched && previous.touched {
+                self.window.touch_gap.record(gap);
                 let step = pad
                     .position
                     .x
@@ -99,6 +217,11 @@ impl InputTrace {
     pub fn take(&mut self) -> InputWindow {
         std::mem::take(&mut self.window)
     }
+
+    #[cfg(target_os = "espidf")]
+    pub fn window(&mut self) -> &mut InputWindow {
+        &mut self.window
+    }
 }
 
 #[derive(Default)]
@@ -109,22 +232,49 @@ pub(crate) struct OutputWindow {
     pub last_error: i32,
     pub max_gap_us: u64,
     pub max_step: u16,
+    pub attempts: u32,
+    pub attempt_gap: Timing,
+    pub submit_gap: Timing,
+    pub sample_age: Timing,
+    #[cfg(target_os = "espidf")]
+    pub interval_us: u64,
 }
 
 #[derive(Default)]
 pub(crate) struct OutputTrace {
     since_us: Option<u64>,
     last: Option<(u64, [u16; 2])>,
+    last_attempt: Option<u64>,
     window: OutputWindow,
 }
 
 impl OutputTrace {
+    pub fn attempted(&mut self, time: u64) {
+        self.window.attempts += 1;
+        if let Some(then) = self.last_attempt.replace(time) {
+            self.window.attempt_gap.record(time.saturating_sub(then));
+        }
+    }
+
+    pub fn record_submit_age(&mut self, time: u64, sample: Option<u64>) {
+        if let Some(sample) = sample {
+            self.window.sample_age.record(time.saturating_sub(sample));
+        }
+    }
+
+    #[cfg(target_os = "espidf")]
+    pub fn set_interval(&mut self, interval_us: u64) {
+        self.window.interval_us = interval_us;
+    }
+
     pub fn queued(&mut self, time: u64, report: &[u8; REPORT_LEN]) {
         let [lo, packed, hi] = [report[8], report[9], report[10]].map(u16::from);
         let axes = [lo | ((packed & 0x0f) << 8), (packed >> 4) | (hi << 4)];
         self.window.queued += 1;
         if let Some((then, previous)) = self.last.replace((time, axes)) {
-            self.window.max_gap_us = self.window.max_gap_us.max(time.saturating_sub(then));
+            let gap = time.saturating_sub(then);
+            self.window.submit_gap.record(gap);
+            self.window.max_gap_us = self.window.max_gap_us.max(gap);
             let step = axes[0]
                 .abs_diff(previous[0])
                 .max(axes[1].abs_diff(previous[1]));

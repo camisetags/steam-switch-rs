@@ -6,7 +6,7 @@ A Rust firmware project for an ESP32-S3 that connects a Steam Controller (2026) 
 - Hold R4 for 40% of the physical right stick's range or L4 for 50%. Holding both uses 40%. Release both to restore full range. L5 and R5 are disabled.
 - With the game's motion aiming setting off, hold L4 to steer the right stick by rotating the controller. Release L4 to reposition the controller.
 - Touching the left trackpad away from its center presses one of the four D-pad directions. The right trackpad steers the camera while the finger moves, smoothing the transitions in stick deflection. The physical D-pad and right stick take priority over their trackpad counterparts.
-- The right trackpad and gyro estimate camera movement for up to 45 ms after the latest sample, then fade toward center. Releasing the touchpad or L4 clears that source immediately. The right trackpad uses its recent sample cadence when reports arrive together.
+- The right trackpad gradually brings in very slow motion based on speed. The trackpad and gyro predict motion through short gaps of up to 45 ms, then fade toward center. Releasing the trackpad or L4 clears that source immediately. The right trackpad uses its recent cadence to estimate timing for delayed samples during a steady swipe and for reports that arrive together.
 - Trackpad feedback uses short, local ticks for D-pad directions and camera swipes, and a stronger pulse for a physical trackpad click.
 - The firmware implements console input reports, motion, battery level, rumble, pairing, and reconnect. The local web editor records, edits, saves and plays controller macros.
 
@@ -53,9 +53,38 @@ espflash flash --port PORT --monitor --flash-mode dio --flash-size 4mb \
 
 Optional build-time variables are `STEAM_CONTROLLER_MAC` (an allowlist of Bluetooth addresses separated by spaces or commas), `STEAM_SWITCH_WIFI_SSID` and `STEAM_SWITCH_WIFI_PASSWORD` (8–63 bytes). The editor uses `SteamSwitch-RS` and an open local Wi-Fi network by default. Set a password if people nearby should be unable to join. After connecting to the access point, open [the editor](http://192.168.4.1/).
 
-Build with `STEAM_SWITCH_AIM_DIAGNOSTICS=1` to log one timing summary per second over UART at 115200 baud while both Bluetooth links are active. The `rx` and `touch` counts and gaps describe Steam Controller samples. The `tx` count and gaps describe accepted NimBLE submissions to the Switch. `pool_busy` counts waits for buffer headroom, and `tx_errors` counts failed submissions. The reported stick step is the largest per-axis change between consecutive submissions in 12-bit stick counts.
-
 Pair the Steam Controller in Bluetooth mode by holding **B + R1 + Steam** from power off. On the Switch 2, open **Controllers → Change Grip/Order**. Pairing and gameplay on physical hardware are separate from the PC tests.
+
+## Compare trackpad timing
+
+Run the same synthetic swipes on a computer with `cargo test --locked -p controller-core --test input -- --nocapture`. The slow swipe fixture runs at 7.5, 10, and 15 ms sample intervals. The batch fixture replays the same positions with regular arrivals and with a 45 ms pause followed by packets 2 ms apart. Both print comparable 12-bit stick values.
+
+| Synthetic fixture | Before (`d80a346`) | With the new filter |
+| --- | --- | --- |
+| Slow swipe, stick X at 7.5, 10, and 15 ms | 2048, 2048, 2362 | 2067, 2067, 2067 |
+| Batch replay, largest difference from regular delivery | 35 counts | 1 count |
+
+Stick center is 2048. These figures describe the filter with simulated arrivals. The game's deadzone and the radio links need a separate gameplay capture.
+
+For real gameplay, keep the ESP32-S3 connected to the PC for UART at 115200 baud and pair both Bluetooth links. Build and flash each configuration with the instructions above. Set `STEAM_SWITCH_AIM_DIAGNOSTICS=1` for every comparison build.
+
+| Variant | Additional build variables |
+| --- | --- |
+| Reference | Unset the three variables below |
+| Wi-Fi off | `STEAM_SWITCH_WIFI_ENABLED=0` |
+| Rumble off | `STEAM_SWITCH_RUMBLE_ENABLED=0` |
+| Trackpad feedback off | `STEAM_SWITCH_PAD_FEEDBACK_ENABLED=0` |
+| Rumble and trackpad feedback off | Set both feedback variables to `0` |
+
+The Wi-Fi switch skips initialization of the access point and editor. Saved macros stay in the storage partition. Use the same game, camera settings, distance, and other build variables for each run. Verify `wifi_active=true` in the reference boot log before attributing a difference to an active access point. Repeat slow straight and diagonal swipes, quick direction changes, flicks, and finger release. Check the physical stick, L4 aim, tactile feedback, rumble, macros, and reconnection at the end of the session.
+
+With ESP-IDF 6.1.1 and `esp-idf-svc` 0.53.0, the firmware supplies the SDK's default Wi-Fi task stack size when the wrapper library leaves it unset. See [the upstream fix](https://github.com/esp-rs/esp-idf/pull/610).
+
+- `Aim timing` counts received input, moving touch samples, accepted reports, retries for buffer headroom, and failed submissions. `stick_step` is the largest change on either right-stick axis between accepted submissions.
+- `Aim timings` adds the negotiated Switch interval, send attempts, input age at submission, and distributions for receipt, touch, attempts, and accepted submissions. The five gap counts are cumulative at 25, 35, 45, 60, and 100 ms.
+- `Aim processing` measures decode time, waits for shared input and macro state, work after those locks are acquired, and the reported input's age during aim calculation. Each distribution is `count/mean/p50/p95/p99/max` in microseconds, with percentile upper bounds estimated from fixed buckets.
+
+Reception timestamps come from the BLE notification callback. Submission timestamps come from the return of the NimBLE call. Compare both with the motion you see in the game. Logs summarize one-second windows outside the BLE callbacks.
 
 ## Sources and licensing
 

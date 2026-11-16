@@ -20,6 +20,8 @@ const AIM_RESET_US: u64 = 100_000;
 const AIM_BURST_US: u64 = 5_000;
 const AIM_NOMINAL_SAMPLE_US: u64 = 15_000;
 const AIM_MAX_REGULAR_SAMPLE_US: u64 = 25_000;
+const AIM_MIN_SPEED: f32 = 1_600.;
+const AIM_FULL_LOW_SPEED_GAIN: f32 = 8_000.;
 const PAD_CLICK_MASKS: [u32; 2] = [1 << 26, 1 << 22];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -289,6 +291,7 @@ pub struct Mapper {
     previous_aim: Option<(Stick, u64)>,
     aim_start: [f32; 2],
     aim_target: [f32; 2],
+    aim_speed: f32,
     aim_recover_until: u64,
     aim_sample_interval: Option<u64>,
     right_stick_active: bool,
@@ -384,6 +387,8 @@ impl Mapper {
         let start = self.aim_at(now_us);
         let current = pad.touched.then_some((pad.position, now_us));
         let previous = std::mem::replace(&mut self.previous_aim, current);
+        let last_target = self.aim_target;
+        let last_speed = std::mem::take(&mut self.aim_speed);
         self.aim_start = [0.; 2];
         self.aim_target = [0.; 2];
         let Some(((point, now), (old, then))) = current.zip(previous) else {
@@ -397,7 +402,8 @@ impl Mapper {
         if observed_us >= AIM_RESET_US {
             return;
         }
-        if (AIM_BURST_US..=AIM_MAX_REGULAR_SAMPLE_US).contains(&observed_us) {
+        let recovering = now < self.aim_recover_until;
+        if !recovering && (AIM_BURST_US..=AIM_MAX_REGULAR_SAMPLE_US).contains(&observed_us) {
             let previous = self.aim_sample_interval.unwrap_or(observed_us);
             self.aim_sample_interval = Some((3 * previous + observed_us) / 4);
         }
@@ -405,18 +411,32 @@ impl Mapper {
         let dx = f32::from(point.x) - f32::from(old.x);
         let dy = f32::from(point.y) - f32::from(old.y);
         let distance = dx.hypot(dy);
-        if distance < 24. {
+        if distance == 0. {
             return;
         }
-        // Bluetooth can deliver buffered samples together. Use the usual sample
-        // interval for these arrivals so the transport doesn't amplify the swipe.
-        let sample_us = if observed_us < AIM_BURST_US {
-            self.aim_sample_interval.unwrap_or(AIM_NOMINAL_SAMPLE_US)
+        let cadence = self.aim_sample_interval.unwrap_or(AIM_NOMINAL_SAMPLE_US);
+        let expected_step = last_speed * cadence as f32 / 1_000_000.;
+        // The first packet after a gap may have been sampled earlier. Infer
+        // one sample interval only when its direction and step match the swipe.
+        let likely_delayed_sample = (AIM_RECOVERY_GAP_US..=AIM_PREDICTION_US)
+            .contains(&observed_us)
+            && last_target[0] * dx + last_target[1] * dy > 0.
+            && (expected_step * 0.75..=expected_step * 1.25).contains(&distance);
+        let sample_us = if observed_us < AIM_BURST_US
+            || (recovering && observed_us < cadence)
+            || likely_delayed_sample
+        {
+            cadence
         } else {
             observed_us
         };
         let speed = distance * 1_000_000. / sample_us as f32;
-        let strength = 0.15 + 0.85 * (speed / 500_000.).min(1.);
+        self.aim_speed = speed;
+        // Fade in the existing low-speed gain based on speed, so the same
+        // motion has the same threshold at different report intervals.
+        let ramp =
+            ((speed - AIM_MIN_SPEED) / (AIM_FULL_LOW_SPEED_GAIN - AIM_MIN_SPEED)).clamp(0., 1.);
+        let strength = (0.15 + 0.85 * (speed / 500_000.).min(1.)) * ramp;
         self.aim_target = [dx * strength / distance, dy * strength / distance];
         self.aim_start = reconcile_aim(start, self.aim_target);
     }

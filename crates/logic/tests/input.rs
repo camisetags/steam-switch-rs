@@ -349,10 +349,11 @@ fn right_pad_keeps_steady_speed_across_a_short_gap_and_resumes_without_a_jump() 
         assert!((2480..=2500).contains(&steady));
         assert!(axis(&report, 8).abs_diff(steady) <= 8);
 
-        let mut resumed = mapper.encode(&packet(5400, true, format), battery, 265_000);
+        // Two samples were lost. The latest position spans all three intervals.
+        let mut resumed = mapper.encode(&packet(6600, true, format), battery, 265_000);
         assert_eq!(axis(&resumed, 8), axis(&report, 8));
         mapper.apply_aim(&mut resumed, 280_000);
-        assert!((2400..steady).contains(&axis(&resumed, 8)));
+        assert!(axis(&resumed, 8).abs_diff(steady) <= 8);
     }
 }
 
@@ -417,6 +418,79 @@ fn aim_uses_the_recent_sample_cadence_for_back_to_back_packets() {
     assert!(normal > 2048);
     assert_eq!(render_step(500), normal);
     assert_eq!(render_step(0), normal);
+}
+
+fn replay_swipe(arrivals: &[u64], step: i16, report_times: &[u64]) -> Vec<u16> {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    let mut report = [0; 63];
+    let mut next = 0;
+    report_times
+        .iter()
+        .map(|&time| {
+            while let Some(&arrival) = arrivals.get(next).filter(|&&arrival| arrival <= time) {
+                let input = packet(next as i16 * step, true, 0x45);
+                report = mapper.encode(&input, battery, arrival);
+                next += 1;
+            }
+            mapper.apply_aim(&mut report, time);
+            axis(&report, 8)
+        })
+        .collect()
+}
+
+#[test]
+fn slow_swipes_have_the_same_deflection_at_different_sample_cadences() {
+    let deflections = [7_500, 10_000, 15_000].map(|interval| {
+        let arrivals: Vec<_> = (0..=150_000).step_by(interval).collect();
+        let step = (interval / 500) as i16; // 2,000 counts per second
+        replay_swipe(&arrivals, step, &[150_000])[0]
+    });
+    println!("Slow swipe, x at 7.5/10/15 ms: {deflections:?}");
+    assert!((2052..2100).contains(&deflections[0]));
+    assert!(deflections.iter().all(|&x| x.abs_diff(deflections[0]) <= 2));
+}
+
+#[test]
+fn delayed_batches_preserve_steady_swipe_without_a_rebound() {
+    let regular = [
+        0, 15_000, 30_000, 45_000, 60_000, 75_000, 90_000, 105_000, 120_000,
+    ];
+    let bunched = [
+        0, 15_000, 30_000, 75_000, 77_000, 79_000, 90_000, 105_000, 120_000,
+    ];
+    let times = [
+        60_000, 75_000, 77_000, 79_000, 85_000, 90_000, 100_000, 115_000,
+    ];
+    let reference = replay_swipe(&regular, 1500, &times);
+    let resumed = replay_swipe(&bunched, 1500, &times);
+    let maximum_error = resumed
+        .iter()
+        .zip(reference)
+        .map(|(&a, b)| a.abs_diff(b))
+        .max()
+        .unwrap();
+    println!("Batch replay, largest difference from regular cadence: {maximum_error} stick counts");
+    assert!(maximum_error <= 8);
+}
+
+#[test]
+fn fast_diagonal_flick_keeps_its_strength_and_stops_on_release() {
+    let mut mapper = Mapper::default();
+    let battery = Battery::default();
+    let mut input = packet(0, true, 0x45);
+    mapper.encode(&input, battery, 100_000);
+    input.right_pad.position = Stick { x: 9000, y: 9000 };
+    let mut report = mapper.encode(&input, battery, 115_000);
+    mapper.apply_aim(&mut report, 130_000);
+    let [x, y] = right_stick(&report);
+    assert_eq!(x, y);
+    assert!(x >= 3150);
+    input.right_pad.touched = false;
+    assert_eq!(
+        right_stick(&mapper.encode(&input, battery, 131_000)),
+        [2048; 2]
+    );
 }
 
 #[test]

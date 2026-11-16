@@ -23,6 +23,18 @@ use std::{
     time::Duration,
 };
 
+const WIFI_ENABLED: bool = enabled(option_env!("STEAM_SWITCH_WIFI_ENABLED"));
+pub(crate) const RUMBLE_ENABLED: bool = enabled(option_env!("STEAM_SWITCH_RUMBLE_ENABLED"));
+pub(crate) const PAD_FEEDBACK_ENABLED: bool =
+    enabled(option_env!("STEAM_SWITCH_PAD_FEEDBACK_ENABLED"));
+
+const fn enabled(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(value.as_bytes(), b"0"),
+        None => true,
+    }
+}
+
 pub(crate) fn now() -> u64 {
     // ESP-IDF uses a monotonic, nonnegative microsecond clock after boot.
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
@@ -35,6 +47,7 @@ struct Source {
     wake_buttons: u32,
     live: [u8; 63],
     pad_feedback: PadFeedback,
+    sample_time_us: Option<u64>,
     aim_diagnostics: Option<InputTrace>,
 }
 
@@ -48,6 +61,7 @@ impl Default for Source {
             wake_buttons: 0,
             live: input::neutral(battery),
             pad_feedback: PadFeedback::default(),
+            sample_time_us: None,
             aim_diagnostics: aim_diagnostics::ENABLED.then(InputTrace::default),
         }
     }
@@ -55,7 +69,7 @@ impl Default for Source {
 
 pub(crate) struct State {
     source: Mutex<Source>,
-    pub report: Mutex<[u8; 63]>,
+    report: Mutex<([u8; 63], Option<u64>)>,
     pub macro_engine: Mutex<MacroEngine>,
     pub steam_connected: AtomicBool,
     pub console_connected: AtomicBool,
@@ -70,7 +84,7 @@ impl State {
         let neutral = input::neutral(Battery::default());
         Self {
             source: Mutex::default(),
-            report: Mutex::new(neutral),
+            report: Mutex::new((neutral, None)),
             macro_engine: Mutex::default(),
             steam_connected: AtomicBool::default(),
             console_connected: AtomicBool::default(),
@@ -85,17 +99,17 @@ impl State {
         let Some(input) = input::decode(id, payload) else {
             return;
         };
+        let trace_active = aim_diagnostics::ENABLED && self.console_streaming.load(Relaxed);
+        let decoded = if trace_active { now() } else { 0 };
         let mut source = self.source.lock().unwrap();
+        let locked = if trace_active { now() } else { 0 };
         let wake_buttons = input.wake_buttons();
         if wake_buttons & !source.wake_buttons != 0 && !self.console_connected.load(Relaxed) {
             self.wake_requested.store(true, Relaxed);
         }
         source.wake_buttons = wake_buttons;
-        source.pad_feedback.update(&input, time);
-        if let Some(trace) = &mut source.aim_diagnostics
-            && self.console_streaming.load(Relaxed)
-        {
-            trace.receive(time, input.right_pad);
+        if PAD_FEEDBACK_ENABLED {
+            source.pad_feedback.update(&input, time);
         }
         let battery = source.battery;
         let mut report = source.mapper.encode(&input, battery, time);
@@ -103,6 +117,17 @@ impl State {
             .motion
             .apply(input.imu, input.motion_aim_enabled(), time, &mut report);
         source.live = report;
+        if trace_active {
+            source.sample_time_us = Some(time);
+            if let Some(trace) = &mut source.aim_diagnostics {
+                let finished = now();
+                trace.receive(time, input.right_pad);
+                let window = trace.window();
+                window.decode.record(decoded.saturating_sub(time));
+                window.input_wait.record(locked.saturating_sub(decoded));
+                window.input_update.record(finished.saturating_sub(locked));
+            }
+        }
     }
 
     pub fn set_battery(&self, payload: &[u8]) {
@@ -115,11 +140,14 @@ impl State {
         self.steam_connected.store(false, Relaxed);
         let mut source = self.source.lock().unwrap();
         *source = Source::default();
-        *self.report.lock().unwrap() = source.live;
+        *self.report.lock().unwrap() = (source.live, None);
         *self.rumble.lock().unwrap() = (0, 0, 0);
     }
 
     pub fn rumble(&self, left: u16, right: u16, duration_ms: u64) {
+        if !RUMBLE_ENABLED {
+            return;
+        }
         *self.rumble.lock().unwrap() = (
             left,
             right,
@@ -138,6 +166,14 @@ impl State {
 
     pub fn take_pad_feedback(&self, time: u64) -> [Option<PadEffect>; 2] {
         self.source.lock().unwrap().pad_feedback.take(time)
+    }
+
+    pub fn report_for_send(&self) -> ([u8; 63], Option<u64>) {
+        *self.report.lock().unwrap()
+    }
+
+    pub fn report(&self) -> [u8; 63] {
+        self.report_for_send().0
     }
 
     pub fn stage_aim_window(&self, time: u64, elapsed: u64, output: OutputWindow) {
@@ -169,20 +205,68 @@ impl State {
                 out.rejected,
                 out.last_error,
             );
+            log::info!(
+                "Aim timings: at_us={time} ble_us={} tx_attempts={} rx={} touch={} attempts={} submit={} sample_age={} rx_gaps={:?} touch_gaps={:?} tx_gaps={:?}",
+                out.interval_us,
+                out.attempts,
+                input.gap,
+                input.touch_gap,
+                out.attempt_gap,
+                out.submit_gap,
+                out.sample_age,
+                input.gap.long_gaps(),
+                input.touch_gap.long_gaps(),
+                out.submit_gap.long_gaps(),
+            );
+            log::info!(
+                "Aim processing: at_us={time} decode={} input_wait={} input_update={} output_wait={} aim={} aim_age={} macro_wait={} output_work={}",
+                input.decode,
+                input.input_wait,
+                input.input_update,
+                input.output_wait,
+                input.aim,
+                input.aim_sample_age,
+                input.macro_wait,
+                input.output_work,
+            );
         }
     }
 
-    fn output(&self, time: u64, select: bool) {
-        let source = self.source.lock().unwrap();
+    fn output(&self, time: u64, streaming: bool, select: bool) {
+        let trace_active = aim_diagnostics::ENABLED && streaming;
+        let mut source = self.source.lock().unwrap();
+        let locked = if trace_active { now() } else { 0 };
+        if aim_diagnostics::ENABLED && !streaming && source.sample_time_us.take().is_some() {
+            source.aim_diagnostics = Some(InputTrace::default());
+        }
         let mut live = source.live;
         source.mapper.apply_aim(&mut live, time);
+        let aimed = if trace_active { now() } else { 0 };
         let mut macros = self.macro_engine.lock().unwrap();
+        let macro_locked = if trace_active { now() } else { 0 };
         macros.capture(&live, time);
         if select {
             live[2] |= 0x10;
             live[3] |= 0x10;
         }
-        *self.report.lock().unwrap() = macros.output(&live, time);
+        let report = macros.output(&live, time);
+        let sample_time = source.sample_time_us;
+        *self.report.lock().unwrap() = (report, sample_time);
+        if trace_active && let Some(trace) = &mut source.aim_diagnostics {
+            let finished = now();
+            let window = trace.window();
+            window.output_wait.record(locked.saturating_sub(time));
+            window.aim.record(aimed.saturating_sub(locked));
+            if let Some(sample_time) = sample_time {
+                window
+                    .aim_sample_age
+                    .record(aimed.saturating_sub(sample_time));
+            }
+            window.macro_wait.record(macro_locked.saturating_sub(aimed));
+            window
+                .output_work
+                .record(finished.saturating_sub(macro_locked));
+        }
     }
 }
 
@@ -202,13 +286,35 @@ pub fn run() -> Result<()> {
     let peripherals = Peripherals::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
     let state = Arc::new(State::new());
-    let _editor = match macros_web::start(peripherals.modem, state.clone(), nvs.clone()) {
-        Ok(editor) => Some(editor),
-        Err(error) => {
-            log::error!("Macro editor unavailable: {error:#}");
-            None
+    if aim_diagnostics::ENABLED {
+        let caps = esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT;
+        // These ESP-IDF functions query heap statistics without modifying the heap.
+        let (free, largest) = unsafe {
+            (
+                esp_idf_svc::sys::heap_caps_get_free_size(caps),
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(caps),
+            )
+        };
+        log::info!("Internal heap before Wi-Fi: free={free} largest={largest}");
+    }
+    let editor = if WIFI_ENABLED {
+        match macros_web::start(peripherals.modem, state.clone(), nvs.clone()) {
+            Ok(editor) => Some(editor),
+            Err(error) => {
+                log::error!("Macro editor unavailable: {error:#}");
+                None
+            }
         }
+    } else {
+        None
     };
+    log::info!(
+        "Gameplay settings: wifi_requested={} wifi_active={} rumble={} pad_feedback={}",
+        WIFI_ENABLED,
+        editor.is_some(),
+        RUMBLE_ENABLED,
+        PAD_FEEDBACK_ENABLED,
+    );
     let device = BLEDevice::take();
     device
         .security()
@@ -230,7 +336,7 @@ pub fn run() -> Result<()> {
                     select_until = time + 1_000_000;
                 }
                 was_streaming = streaming;
-                shared.output(time, streaming && time < select_until);
+                shared.output(time, streaming, streaming && time < select_until);
                 if let Err(error) = console.poll() {
                     log::warn!("Switch output: {error:#}");
                 }

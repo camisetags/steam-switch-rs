@@ -342,6 +342,10 @@ impl Console {
         {
             callbacks.state.stage_aim_window(now_us, elapsed, out);
         }
+        if let Some(trace) = &mut self.aim_diagnostics {
+            trace.set_interval(interval_us);
+            trace.attempted(now_us);
+        }
         if !has_mbuf_headroom() {
             self.stream.busy_retries += 1;
             if let Some(trace) = &mut self.aim_diagnostics {
@@ -349,7 +353,7 @@ impl Console {
             }
             return Ok(());
         }
-        let mut report = *callbacks.state.report.lock().unwrap();
+        let (mut report, sample_time_us) = callbacks.state.report_for_send();
         let features = callbacks.protocol.lock().unwrap().features;
         report[0] = self.sequence;
         report[11] = if features & 0x20 != 0 { 0x38 } else { 0x30 };
@@ -364,7 +368,9 @@ impl Console {
             self.pacer.sent(now_us, interval_us);
             self.stream.sent(now_us);
             if let Some(trace) = &mut self.aim_diagnostics {
-                trace.queued(crate::runtime::now(), &report);
+                let submitted = crate::runtime::now();
+                trace.queued(submitted, &report);
+                trace.record_submit_age(submitted, sample_time_us);
             }
         } else {
             self.stream.busy_retries += 1;
@@ -554,7 +560,7 @@ unsafe extern "C" fn attribute_access(
     let context = unsafe { &*context };
     match u32::from(context.op) {
         sys::BLE_GATT_ACCESS_OP_READ_CHR if attribute == INPUT_HANDLE => {
-            let mut report = *callbacks.state.report.lock().unwrap();
+            let mut report = callbacks.state.report();
             if !callbacks.encrypted.load(Relaxed) {
                 report =
                     controller_core::input::neutral(controller_core::input::Battery::default());

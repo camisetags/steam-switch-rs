@@ -26,7 +26,10 @@ use esp32_nimble::{
     BLEAddress, BLEClient, BLEDevice, BLERemoteCharacteristic, BLEScan, utilities::BleUuid, uuid128,
 };
 
-use crate::{State, aim_diagnostics};
+use crate::{
+    State, aim_diagnostics,
+    runtime::{PAD_FEEDBACK_ENABLED, RUMBLE_ENABLED},
+};
 
 const VALVE: BleUuid = uuid128!("100f6c32-1735-4313-b402-38567131e5f3");
 const INPUT_45: BleUuid = uuid128!("100f6c7a-1735-4313-b402-38567131e5f3");
@@ -175,7 +178,15 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
                     log::info!("Steam BLE interval: {} us", u32::from(interval) * 1250);
                 }
                 if let Some(target) = wire::faster_interval(interval, attempts) {
-                    if let Err(error) = client.update_conn_params(target, target, 0, 400) {
+                    let result = client.update_conn_params(target, target, 0, 400);
+                    if aim_diagnostics::ENABLED {
+                        log::info!(
+                            "Steam BLE interval request: {} us, submitted={}",
+                            u32::from(target) * 1250,
+                            result.is_ok(),
+                        );
+                    }
+                    if let Err(error) = result {
                         log::debug!("Steam Controller interval request failed: {error}");
                     }
                     attempts += 1;
@@ -198,7 +209,11 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
         }
 
         let time = monotonic_us();
-        let rumble = state.pending_rumble(time);
+        let rumble = if RUMBLE_ENABLED {
+            state.pending_rumble(time)
+        } else {
+            (0, 0)
+        };
         let refresh = rumble != (0, 0) && now.duration_since(last_rumble) >= RUMBLE_REFRESH;
         if let Some(output) = controller.haptics.as_mut()
             && (rumble != previous_rumble || refresh)
@@ -211,7 +226,8 @@ fn service(client: &mut BLEClient, state: &State, controller: &mut Controller) -
                 Err(error) => log::debug!("Steam Controller rumble write failed: {error}"),
             }
         }
-        if let Some(output) = controller.pad_haptics.as_mut()
+        if PAD_FEEDBACK_ENABLED
+            && let Some(output) = controller.pad_haptics.as_mut()
             && time >= pad_write_backoff
         {
             let effects = state.take_pad_feedback(time);

@@ -31,6 +31,28 @@ const DEFAULT_IP: &str = "192.168.4.1";
 
 type HttpRequest<'request, 'connection> = Request<&'request mut EspHttpConnection<'connection>>;
 
+unsafe extern "C" {
+    fn __real_esp_wifi_init(config: *const sys::wifi_init_config_t) -> sys::esp_err_t;
+}
+
+// esp-idf-svc 0.53.0 zeroes the stack size field added in ESP-IDF 6.1.
+// Remove this wrapper after updating to an esp-idf-svc release with
+// https://github.com/esp-rs/esp-idf/pull/610.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn __wrap_esp_wifi_init(
+    config: *const sys::wifi_init_config_t,
+) -> sys::esp_err_t {
+    // The linker routes esp_wifi_init callers here with the same pointer contract.
+    let Some(mut config_copy) = (unsafe { config.as_ref().copied() }) else {
+        return unsafe { __real_esp_wifi_init(config) };
+    };
+    if config_copy.wifi_task_stack_size == 0 {
+        config_copy.wifi_task_stack_size = sys::WIFI_TASK_STACK_SIZE as _;
+    }
+    // ESP-IDF only reads the temporary configuration during the call.
+    unsafe { __real_esp_wifi_init(&config_copy) }
+}
+
 pub struct MacroWeb {
     _server: EspHttpServer<'static>,
     _storage: SpiffsMount,
@@ -363,7 +385,7 @@ fn route(
                 .unwrap_or("start")
             {
                 "start" => {
-                    let report = *state.report.lock().unwrap();
+                    let report = state.report();
                     state.macro_engine.lock().unwrap().record(now_us(), &report);
                     json!({"ok": true, "recording": true})
                 }
